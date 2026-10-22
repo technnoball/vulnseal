@@ -1,0 +1,49 @@
+{
+  "name": "patchledger",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Evidence-aware, dispute-resolvable blockchain repair passports for refurbished laptops (research prototype, local-only).",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "compile": "hardhat compile --config hardhat.config.cjs",
+    "chain": "hardhat node --config hardhat.config.cjs --hostname 127.0.0.1",
+    "deploy": "node scripts/deploy.ts",
+    "seed": "node scripts/seed.ts",
+    "server": "node server/index.ts",
+    "build:web": "vite build --config web/vite.config.ts",
+    "dev:web": "vite --config web/vite.config.ts",
+    "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
+    "test": "npm run compile && node --test --test-concurrency=1 tests/contract/*.test.ts tests/app/*.test.ts",
+    "test:contract": "npm run compile && node --test --test-concurrency=1 tests/contract/*.test.ts",
+    "test:app": "npm run compile && node --test --test-concurrency=1 tests/app/*.test.ts",
+    "test:smoke": "node --test tests/smoke/*.test.ts",
+    "benchmark": "node scripts/benchmark.ts",
+    "integrity": "node scripts/integrity-check.ts",
+    "verify-export": "node scripts/verify-export.ts"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-sans": "^5.3.0",
+    "ethers": "^6.17.0",
+    "express": "^5.3.0",
+    "multer": "^2.4.0",
+    "qrcode": "1.5",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^24.19.2",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "hardhat": "^2.29.1",
+    "typescript": "5.9",
+    "vite": "^7.3.7"
+  }
+}

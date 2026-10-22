@@ -1,0 +1,638 @@
+{
+  "schema": "patchledger.benchmark.v1",
+  "generatedAt": "2026-10-21T18:01:33.423Z",
+  "config": {
+    "devices": 20,
+    "eventsPerDevice": 10,
+    "seed": 42,
+    "trials": 20,
+    "totalRecords": 220,
+    "node": "v24.19.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M4",
+    "hardhat": "2.29.1",
+    "solc": "0.8.28 (optimizer 200 runs)"
+  },
+  "workload": {
+    "typeMix": {
+      "REGISTRATION": 20,
+      "COMPONENT_REPLACEMENT": 32,
+      "REPAIR": 53,
+      "DIAGNOSTIC": 51,
+      "INSPECTION": 34,
+      "CORRECTION": 16,
+      "CUSTODY_TRANSFER": 14
+    },
+    "evidenceFiles": 73
+  },
+  "baselineVerificationErrors": {
+    "editable": 0,
+    "hardened": 0,
+    "hardened-anchored": 0,
+    "blockchain": 0
+  },
+  "stores": [
+    {
+      "id": "editable",
+      "name": "Editable SQLite",
+      "description": "CRUD store; app-level roles; corrections and dispute status updated in place",
+      "insert": {
+        "n": 220,
+        "median": 0.077,
+        "p95": 0.147,
+        "mean": 0.087,
+        "min": 0.056,
+        "max": 0.453
+      },
+      "verify": {
+        "n": 20,
+        "median": 0.109,
+        "p95": 0.17,
+        "mean": 0.111,
+        "min": 0.021,
+        "max": 0.213
+      },
+      "throughputPerSec": 11515.235991940444,
+      "storage": {
+        "offChainBytesPerRecord": 577.1636363636363,
+        "onChainBytesPerRecord": null,
+        "calldataBytesPerRecord": null,
+        "method": "SQLite page_count×page_size ÷ records (after WAL checkpoint); evidence files excluded for all stores"
+      },
+      "gas": null
+    },
+    {
+      "id": "hardened",
+      "name": "Hardened SQLite",
+      "description": "Append-only triggers; SHA-256 hash chain; app-level roles",
+      "insert": {
+        "n": 220,
+        "median": 0.07,
+        "p95": 0.13,
+        "mean": 0.083,
+        "min": 0.049,
+        "max": 0.271
+      },
+      "verify": {
+        "n": 20,
+        "median": 0.151,
+        "p95": 0.21,
+        "mean": 0.156,
+        "min": 0.063,
+        "max": 0.247
+      },
+      "throughputPerSec": 12109.739560785254,
+      "storage": {
+        "offChainBytesPerRecord": 875.0545454545454,
+        "onChainBytesPerRecord": null,
+        "calldataBytesPerRecord": null,
+        "method": "SQLite page_count×page_size ÷ records (after WAL checkpoint); evidence files excluded for all stores"
+      },
+      "gas": null
+    },
+    {
+      "id": "hardened-anchored",
+      "name": "Hardened + checkpoints",
+      "description": "As hardened, plus head hashes handed to an independent party after every write",
+      "insert": {
+        "n": 220,
+        "median": 0.106,
+        "p95": 0.16,
+        "mean": 0.116,
+        "min": 0.082,
+        "max": 0.247
+      },
+      "verify": {
+        "n": 20,
+        "median": 0.14,
+        "p95": 0.195,
+        "mean": 0.142,
+        "min": 0.058,
+        "max": 0.207
+      },
+      "throughputPerSec": 8602.091340447207,
+      "storage": {
+        "offChainBytesPerRecord": 875.0545454545454,
+        "onChainBytesPerRecord": null,
+        "calldataBytesPerRecord": null,
+        "method": "SQLite page_count×page_size ÷ records (after WAL checkpoint); evidence files excluded for all stores"
+      },
+      "gas": null
+    },
+    {
+      "id": "blockchain",
+      "name": "PatchLedger (local chain)",
+      "description": "Solidity contract enforces roles and append-only links; payloads off-chain, digests on-chain",
+      "insert": {
+        "n": 220,
+        "median": 16.598,
+        "p95": 17.927,
+        "mean": 16.502,
+        "min": 13.298,
+        "max": 20.759
+      },
+      "verify": {
+        "n": 20,
+        "median": 5.934,
+        "p95": 7.208,
+        "mean": 6.033,
+        "min": 4.867,
+        "max": 7.776
+      },
+      "throughputPerSec": 60.60012922233834,
+      "storage": {
+        "offChainBytesPerRecord": 1247.418181818182,
+        "onChainBytesPerRecord": 133.23636363636365,
+        "calldataBytesPerRecord": 184.36363636363637,
+        "method": "off-chain: SQLite page_count×page_size ÷ records; on-chain: contract storage slots written (4×32 B per record + per-device and per-correction mapping slots), from the struct layout"
+      },
+      "gas": {
+        "meanPerRecord": 135582.35,
+        "perType": {
+          "REGISTRATION": {
+            "n": 20,
+            "median": 132175
+          },
+          "COMPONENT_REPLACEMENT": {
+            "n": 32,
+            "median": 133689
+          },
+          "REPAIR": {
+            "n": 53,
+            "median": 133672
+          },
+          "DIAGNOSTIC": {
+            "n": 51,
+            "median": 133655
+          },
+          "INSPECTION": {
+            "n": 34,
+            "median": 133721
+          },
+          "CORRECTION": {
+            "n": 16,
+            "median": 159543
+          },
+          "CUSTODY_TRANSFER": {
+            "n": 14,
+            "median": 133753
+          }
+        },
+        "deployment": 1716175
+      }
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "S1",
+      "title": "Unauthorized modification of an existing record",
+      "attacker": "Database administrator edits a claim directly (bypassing the app) and recomputes that record's own digest/hash",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": "No integrity metadata covers record content"
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 19,
+          "undetected": 1,
+          "protectedRate": 0.95,
+          "note": "Edits of the newest record leave no broken link and pass local verification"
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        }
+      }
+    },
+    {
+      "id": "S2",
+      "title": "Consistent history rewrite",
+      "attacker": "Database administrator edits a claim and recomputes every subsequent hash so the local chain is self-consistent",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": ""
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "Detected because the externally held head hash no longer matches"
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "Off-chain rewrite detected; the on-chain rewrite attempt reverted (StalePrevHash)"
+        }
+      }
+    },
+    {
+      "id": "S3",
+      "title": "Deletion of an event record",
+      "attacker": "Database administrator deletes a record row",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 19,
+          "undetected": 1,
+          "protectedRate": 0.95,
+          "note": "Only deletions that leave a sequence gap are noticed; deleting the newest record is not"
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 19,
+          "undetected": 1,
+          "protectedRate": 0.95,
+          "note": "Deleting the newest record leaves the remaining chain valid"
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        }
+      }
+    },
+    {
+      "id": "S4",
+      "title": "Alteration of a supporting evidence file",
+      "attacker": "Attacker with write access to the evidence file store replaces a file's bytes",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "Detected because this baseline also stores SHA-256 digests"
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        }
+      }
+    },
+    {
+      "id": "S5",
+      "title": "Evidence file and its stored digest replaced together",
+      "attacker": "Attacker with database and file-store access replaces a file and updates the digest stored with it (recomputing that record's own hash where one exists)",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": ""
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        }
+      }
+    },
+    {
+      "id": "S6",
+      "title": "Unauthorized role submits a record",
+      "attacker": "A party without the required role (buyer, auditor, unregistered account, or a different repairer correcting someone else's claim) uses the normal write path",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "Rejected by application code; relies on every write going through the application"
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "Reverted by the contract (NotAuthorized / NotOriginalActor)"
+        }
+      }
+    },
+    {
+      "id": "S7",
+      "title": "Insider forges a record in an authorized party's name",
+      "attacker": "Operator of the record store inserts a well-formed repair record attributed to an authorized repairer, without that repairer's key",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": ""
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": "Hash chains without per-party signatures cannot attribute records; the forged record is correctly hashed"
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "The insider lacks the repairer's key, so the transaction reverts; an off-chain-only row is flagged UNANCHORED_RECORD"
+        }
+      }
+    },
+    {
+      "id": "S8",
+      "title": "Attempt to hide or overwrite an unresolved dispute",
+      "attacker": "A buyer's challenge is open; the record-store operator tries to make it disappear (status edit, forged resolution, or deletion)",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": "Dispute status is an editable column"
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": "A correctly hashed resolution forged in the auditor's name is indistinguishable from a real one"
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "Non-auditor resolution reverts; open-dispute state lives in the contract; deleting the off-chain copy is flagged"
+        }
+      }
+    },
+    {
+      "id": "S9",
+      "title": "Reuse of a previously submitted evidence digest",
+      "attacker": "A byte-identical receipt is submitted again for a different device",
+      "kind": "detection",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "Same digest-lookup query in every store: an analysis feature, not a blockchain property"
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        }
+      }
+    },
+    {
+      "id": "S10",
+      "title": "Conflicting claims about a component replacement",
+      "attacker": "One repairer records a battery replacement; a later inspection asserts the original battery",
+      "kind": "detection",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 20,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        }
+      }
+    },
+    {
+      "id": "S11",
+      "title": "Correction preserves the earlier claim",
+      "attacker": "The original author corrects a claim through the normal write path; is the original wording still retrievable?",
+      "kind": "preservation",
+      "results": {
+        "editable": {
+          "trials": 20,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 20,
+          "protectedRate": 0,
+          "note": "Conventional CRUD correction overwrites the claim in place"
+        },
+        "hardened": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 20,
+          "prevented": 20,
+          "detected": 0,
+          "undetected": 0,
+          "protectedRate": 1,
+          "note": "Correction is a new record; the original is unchanged on- and off-chain"
+        }
+      }
+    }
+  ],
+  "notes": [
+    "Measured directly: insert latency (one record, application path, excluding evidence-file upload), full-history verification latency per device, throughput (records ÷ summed insert time, single sequential client), SQLite size, gas and calldata from transaction receipts.",
+    "Simulated: attack outcomes. Each attack is actually executed against the store, then that store's own verifier is run. P = prevented (the operation was rejected), D = applied but detected, U = applied and not detected.",
+    "The local Hardhat chain automines every transaction instantly on one node; real deployments add block/consensus latency (seconds) and replication. Latencies here are lower bounds for the blockchain design.",
+    "Blockchain verification includes RPC reads of the on-chain records and re-hashing of evidence files, so it is not directly comparable to an in-process SQLite scan.",
+    "On-chain bytes per record are computed from the contract's storage layout, not measured from node disk usage.",
+    "Insider model: the attacker controls the off-chain database and file store but not other parties' signing keys. In this prototype the server holds all demo keys for convenience, which a production deployment must not do.",
+    "The hardened baseline with external checkpoints detects rewrites of already-checkpointed history as well as the blockchain does; its remaining gap is attribution (no per-party signatures) and the operator's ability to append records in others' names.",
+    "Single run on one machine; results are descriptive. No statistical significance testing was performed; repeat with several seeds to assess variability."
+  ]
+}

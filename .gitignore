@@ -1,0 +1,12 @@
+node_modules/
+build/
+web/dist/
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
