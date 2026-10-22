@@ -22,6 +22,7 @@
     "test:smoke": "node --test tests/smoke/*.test.ts",
     "benchmark": "node scripts/benchmark.ts",
     "integrity": "node scripts/integrity-check.ts",
+    "ledger": "node scripts/show-chain.ts",
     "verify-export": "node scripts/verify-export.ts"
   },
   "dependencies": {

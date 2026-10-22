@@ -80,6 +80,7 @@ A matching digest shows a file is **unchanged since submission**, not that it is
 | `npm run test:smoke` | Runs `./run.sh` on isolated ports, checks every service and seeded page, then checks clean shutdown |
 | `npm run typecheck` | TypeScript checks for the server, scripts, tests and web |
 | `npm run benchmark -- --devices 20 --events 10 --seed 42 --trials 20` | Comparative benchmark; writes to `docs/results/` |
+| `npm run ledger [-- --watch]` | Show the raw blockchain: every block, transaction and decoded record; `--watch` follows new blocks live |
 | `npm run integrity [-- PL-XXXX-XXXX]` | Compares the off-chain store and evidence with on-chain commitments, using the running deployment |
 | `npm run verify-export -- <file> [--rpc URL] [--evidence-dir data/evidence]` | Server-independent verification of an export |
 | `npm run dev:web` | Vite dev server with hot reload (proxies `/api` to the running server) |

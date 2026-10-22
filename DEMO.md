@@ -19,6 +19,23 @@
 3. Have these open in tabs: the app, [docs/results/latest.md](docs/results/latest.md) and [contracts/PatchLedger.sol](contracts/PatchLedger.sol).
 4. Optional backup: run `npm run benchmark -- --devices 10 --events 8` once, so you know it takes about 3 s.
 
+## Showing the blockchain itself
+
+The chain is a local Hardhat node at `http://127.0.0.1:8545`, started by `./run.sh`. It runs in memory and is restarted fresh on every run. Open a **second terminal** in the project folder:
+
+```bash
+npm run ledger -- --watch
+```
+
+This prints every block and transaction since the start, decoded:
+
+- who sent each one, which contract function it called, the gas used, the records it created, and their `recordHash` and `prevHash`;
+- each laptop's records read back with `getRecords()`, plus the `verifyChain()` result.
+
+It then **keeps watching**: every time you click Commit in the app, a new block appears here within a second. Rejected attempts (wrong role, rewrite attempts) create **no block**, because the contract refuses them before they are mined.
+
+Without `--watch`, it prints everything once and exits: `npm run ledger`.
+
 ## Concepts to be able to explain
 
 | Concept | One-line answer |
