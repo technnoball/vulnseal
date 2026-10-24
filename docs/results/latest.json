@@ -1,12 +1,11 @@
 {
-  "schema": "patchledger.benchmark.v1",
-  "generatedAt": "2026-10-21T18:07:37.133Z",
+  "schema": "vulnseal.benchmark.v1",
+  "generatedAt": "2026-10-24T08:35:12.264Z",
   "config": {
-    "devices": 20,
-    "eventsPerDevice": 10,
+    "reports": 40,
     "seed": 42,
-    "trials": 20,
-    "totalRecords": 220,
+    "trials": 12,
+    "pairs": 8,
     "node": "v24.19.0",
     "platform": "darwin",
     "arch": "arm64",
@@ -14,625 +13,796 @@
     "hardhat": "2.29.1",
     "solc": "0.8.28 (optimizer 200 runs)"
   },
-  "workload": {
-    "typeMix": {
-      "REGISTRATION": 20,
-      "COMPONENT_REPLACEMENT": 32,
-      "REPAIR": 53,
-      "DIAGNOSTIC": 51,
-      "INSPECTION": 34,
-      "CORRECTION": 16,
-      "CUSTODY_TRANSFER": 14
-    },
-    "evidenceFiles": 73
-  },
-  "baselineVerificationErrors": {
-    "editable": 0,
-    "hardened": 0,
-    "hardened-anchored": 0,
-    "blockchain": 0
-  },
-  "stores": [
+  "designs": [
     {
       "id": "editable",
       "name": "Editable SQLite",
-      "description": "CRUD store; app-level roles; corrections and dispute status updated in place",
-      "insert": {
-        "n": 220,
-        "median": 0.074,
-        "p95": 0.116,
-        "mean": 0.08,
-        "min": 0.056,
-        "max": 0.42
-      },
-      "verify": {
-        "n": 20,
-        "median": 0.095,
-        "p95": 0.168,
-        "mean": 0.104,
-        "min": 0.022,
-        "max": 0.193
-      },
-      "throughputPerSec": 12428.506429094914,
-      "storage": {
-        "offChainBytesPerRecord": 577.1636363636363,
-        "onChainBytesPerRecord": null,
-        "calldataBytesPerRecord": null,
-        "method": "SQLite page_count×page_size ÷ records (after WAL checkpoint); evidence files excluded for all stores"
-      },
-      "gas": null
+      "description": "Conventional record: rows updated in place, editable status log, unsigned receipts checked against the database",
+      "metrics": {
+        "commit": {
+          "n": 40,
+          "median": 0.319,
+          "p95": 0.464,
+          "mean": 0.341,
+          "min": 0.252,
+          "max": 0.841
+        },
+        "receiptVerify": {
+          "n": 40,
+          "median": 0.01,
+          "p95": 0.016,
+          "mean": 0.014,
+          "min": 0.008,
+          "max": 0.147
+        },
+        "transition": {
+          "n": 200,
+          "median": 0.08,
+          "p95": 0.208,
+          "mean": 0.102,
+          "min": 0.062,
+          "max": 0.259
+        },
+        "revealCheck": {
+          "n": 40,
+          "median": 0.412,
+          "p95": 0.565,
+          "mean": 0.427,
+          "min": 0.325,
+          "max": 0.864
+        },
+        "throughputCommitsPerSec": 2936.632032518262,
+        "storage": {
+          "bytesPerSubmission": 1638.4,
+          "bytesPerEvent": 234.05714285714285,
+          "events": 280,
+          "onChainBytesPerSubmission": null,
+          "calldataBytesPerTx": null,
+          "method": "SQLite page_count x page_size after a WAL checkpoint (sealed content included)"
+        },
+        "gas": null
+      }
     },
     {
       "id": "hardened",
-      "name": "Hardened SQLite",
-      "description": "Append-only triggers; SHA-256 hash chain; app-level roles",
-      "insert": {
-        "n": 220,
-        "median": 0.065,
-        "p95": 0.117,
-        "mean": 0.077,
-        "min": 0.048,
-        "max": 0.284
-      },
-      "verify": {
-        "n": 20,
-        "median": 0.147,
-        "p95": 0.224,
-        "mean": 0.149,
-        "min": 0.061,
-        "max": 0.236
-      },
-      "throughputPerSec": 13053.94024582338,
-      "storage": {
-        "offChainBytesPerRecord": 875.0545454545454,
-        "onChainBytesPerRecord": null,
-        "calldataBytesPerRecord": null,
-        "method": "SQLite page_count×page_size ÷ records (after WAL checkpoint); evidence files excluded for all stores"
-      },
-      "gas": null
+      "name": "Hardened log",
+      "description": "Append-only, SHA-256 hash-chained entries signed by the operator (Ed25519); triggers block UPDATE/DELETE; signed receipts",
+      "metrics": {
+        "commit": {
+          "n": 40,
+          "median": 0.327,
+          "p95": 0.492,
+          "mean": 0.365,
+          "min": 0.283,
+          "max": 1.212
+        },
+        "receiptVerify": {
+          "n": 40,
+          "median": 0.063,
+          "p95": 0.088,
+          "mean": 0.072,
+          "min": 0.059,
+          "max": 0.31
+        },
+        "transition": {
+          "n": 200,
+          "median": 0.086,
+          "p95": 0.328,
+          "mean": 0.126,
+          "min": 0.065,
+          "max": 0.444
+        },
+        "revealCheck": {
+          "n": 40,
+          "median": 0.352,
+          "p95": 0.504,
+          "mean": 0.391,
+          "min": 0.304,
+          "max": 1.151
+        },
+        "throughputCommitsPerSec": 2737.7801407862426,
+        "storage": {
+          "bytesPerSubmission": 3584,
+          "bytesPerEvent": 512,
+          "events": 280,
+          "onChainBytesPerSubmission": null,
+          "calldataBytesPerTx": null,
+          "method": "SQLite page_count x page_size after a WAL checkpoint (sealed content included)"
+        },
+        "gas": null
+      }
     },
     {
       "id": "hardened-anchored",
       "name": "Hardened + checkpoints",
-      "description": "As hardened, plus head hashes handed to an independent party after every write",
-      "insert": {
-        "n": 220,
-        "median": 0.096,
-        "p95": 0.139,
-        "mean": 0.105,
-        "min": 0.079,
-        "max": 0.188
-      },
-      "verify": {
-        "n": 20,
-        "median": 0.135,
-        "p95": 0.185,
-        "mean": 0.136,
-        "min": 0.06,
-        "max": 0.208
-      },
-      "throughputPerSec": 9497.616249421075,
-      "storage": {
-        "offChainBytesPerRecord": 875.0545454545454,
-        "onChainBytesPerRecord": null,
-        "calldataBytesPerRecord": null,
-        "method": "SQLite page_count×page_size ÷ records (after WAL checkpoint); evidence files excluded for all stores"
-      },
-      "gas": null
+      "description": "As hardened, plus the head hash handed to an independent party after every write",
+      "metrics": {
+        "commit": {
+          "n": 40,
+          "median": 0.357,
+          "p95": 0.556,
+          "mean": 0.385,
+          "min": 0.302,
+          "max": 0.828
+        },
+        "receiptVerify": {
+          "n": 40,
+          "median": 11.512,
+          "p95": 12.575,
+          "mean": 11.723,
+          "min": 11.127,
+          "max": 15.636
+        },
+        "transition": {
+          "n": 200,
+          "median": 0.103,
+          "p95": 0.317,
+          "mean": 0.144,
+          "min": 0.081,
+          "max": 0.477
+        },
+        "revealCheck": {
+          "n": 40,
+          "median": 0.372,
+          "p95": 0.45,
+          "mean": 0.387,
+          "min": 0.325,
+          "max": 0.855
+        },
+        "throughputCommitsPerSec": 2598.0144804234787,
+        "storage": {
+          "bytesPerSubmission": 3584,
+          "bytesPerEvent": 512,
+          "events": 280,
+          "onChainBytesPerSubmission": null,
+          "calldataBytesPerTx": null,
+          "method": "SQLite page_count x page_size after a WAL checkpoint (sealed content included)"
+        },
+        "gas": null
+      }
     },
     {
       "id": "blockchain",
-      "name": "PatchLedger (local chain)",
-      "description": "Solidity contract enforces roles and append-only links; payloads off-chain, digests on-chain",
-      "insert": {
-        "n": 220,
-        "median": 16.347,
-        "p95": 17.656,
-        "mean": 16.204,
-        "min": 12.372,
-        "max": 20.659
-      },
-      "verify": {
-        "n": 20,
-        "median": 5.929,
-        "p95": 6.561,
-        "mean": 5.93,
-        "min": 4.604,
-        "max": 7.246
-      },
-      "throughputPerSec": 61.711511941792956,
-      "storage": {
-        "offChainBytesPerRecord": 1247.418181818182,
-        "onChainBytesPerRecord": 133.23636363636365,
-        "calldataBytesPerRecord": 184.36363636363637,
-        "method": "off-chain: SQLite page_count×page_size ÷ records; on-chain: contract storage slots written (4×32 B per record + per-device and per-correction mapping slots), from the struct layout"
-      },
-      "gas": {
-        "meanPerRecord": 135579.8409090909,
-        "perType": {
-          "REGISTRATION": {
-            "n": 20,
-            "median": 132175
-          },
-          "COMPONENT_REPLACEMENT": {
-            "n": 32,
-            "median": 133689
-          },
-          "REPAIR": {
-            "n": 53,
-            "median": 133672
-          },
-          "DIAGNOSTIC": {
-            "n": 51,
-            "median": 133655
-          },
-          "INSPECTION": {
-            "n": 34,
-            "median": 133721
-          },
-          "CORRECTION": {
-            "n": 16,
-            "median": 159543
-          },
-          "CUSTODY_TRANSFER": {
-            "n": 14,
-            "median": 133753
-          }
+      "name": "VulnSeal (local chain)",
+      "description": "Contract enforces roles, transitions and arbitration rules; commitments and a hash-chained log on-chain; content sealed off-chain",
+      "metrics": {
+        "commit": {
+          "n": 40,
+          "median": 20.111,
+          "p95": 22.008,
+          "mean": 20.233,
+          "min": 17.661,
+          "max": 23.907
         },
-        "deployment": 1716175
+        "receiptVerify": {
+          "n": 40,
+          "median": 12.791,
+          "p95": 14.439,
+          "mean": 13.026,
+          "min": 11.098,
+          "max": 15.815
+        },
+        "transition": {
+          "n": 200,
+          "median": 17.307,
+          "p95": 25.373,
+          "mean": 17.872,
+          "min": 12.197,
+          "max": 33.068
+        },
+        "revealCheck": {
+          "n": 40,
+          "median": 22.657,
+          "p95": 26.004,
+          "mean": 22.892,
+          "min": 18.728,
+          "max": 27.278
+        },
+        "throughputCommitsPerSec": 49.424788381837566,
+        "storage": {
+          "bytesPerSubmission": 7782.4,
+          "bytesPerEvent": 1004.1806451612903,
+          "events": 310,
+          "onChainBytesPerSubmission": 224,
+          "calldataBytesPerTx": 84.457,
+          "method": "off-chain: SQLite page_count x page_size of the VulnSeal store (sealed reports, reveals, mirror, rationales); on-chain: storage slots per submission from the contract layout (5-slot struct + replay-protection slot + log-entry slot)"
+        },
+        "gas": {
+          "meanPerSubmission": 166092.6,
+          "meanPerTx": 102034.2642857143,
+          "perOperation": {
+            "anchorCommitment": 165666,
+            "acknowledge": 70803,
+            "requestReveal": 70782,
+            "recordReveal": 95832,
+            "setTriage": 73684,
+            "proposeAssociation": 151751,
+            "reviewAssociation": 144333,
+            "openDispute": 235325,
+            "vote": 140559
+          },
+          "deployment": 4243209
+        }
       }
     }
   ],
   "scenarios": [
     {
       "id": "S1",
-      "title": "Unauthorized modification of an existing record",
-      "attacker": "Database administrator edits a claim directly (bypassing the app) and recomputes that record's own digest/hash",
-      "kind": "attack",
+      "title": "Valid commitment followed by a matching reveal",
+      "attacker": "Honest researcher and reviewer",
+      "kind": "functional",
       "results": {
         "editable": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
           "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
-          "note": "No integrity metadata covers record content"
+          "undetected": 0,
+          "passed": 12,
+          "note": ""
         },
         "hardened": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 19,
-          "undetected": 1,
-          "protectedRate": 0.95,
-          "note": "Edits of the newest record leave no broken link and pass local verification"
+          "detected": 0,
+          "undetected": 0,
+          "passed": 12,
+          "note": ""
         },
         "hardened-anchored": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         }
       }
     },
     {
       "id": "S2",
-      "title": "Consistent history rewrite",
-      "attacker": "Database administrator edits a claim and recomputes every subsequent hash so the local chain is self-consistent",
+      "title": "Reveal containing modified report material",
+      "attacker": "Researcher reveals content edited after committing",
       "kind": "attack",
       "results": {
         "editable": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
-          "note": ""
+          "detected": 12,
+          "undetected": 0,
+          "passed": 0,
+          "note": "Commitment check is cryptography, not storage: every design that keeps a commitment detects this"
         },
         "hardened": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
+          "detected": 12,
+          "undetected": 0,
+          "passed": 0,
           "note": ""
         },
         "hardened-anchored": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 12,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": "Detected because the externally held head hash no longer matches"
+          "passed": 0,
+          "note": ""
         },
         "blockchain": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 12,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": "Off-chain rewrite detected; the on-chain rewrite attempt reverted (StalePrevHash)"
+          "passed": 0,
+          "note": ""
         }
       }
     },
     {
       "id": "S3",
-      "title": "Deletion of an event record",
-      "attacker": "Database administrator deletes a record row",
+      "title": "Operator rewrites a stored commitment so a modified reveal is accepted",
+      "attacker": "Operator with database and signing-key access, colluding with the researcher",
       "kind": "attack",
       "results": {
         "editable": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 19,
-          "undetected": 1,
-          "protectedRate": 0.95,
-          "note": "Only deletions that leave a sequence gap are noticed; deleting the newest record is not"
+          "detected": 0,
+          "undetected": 12,
+          "passed": 0,
+          "note": ""
         },
         "hardened": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 19,
-          "undetected": 1,
-          "protectedRate": 0.95,
-          "note": "Deleting the newest record leaves the remaining chain valid"
+          "detected": 0,
+          "undetected": 12,
+          "passed": 0,
+          "note": "The operator holds the signing key, so a consistent rewrite re-signs cleanly"
         },
         "hardened-anchored": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 12,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 0,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
-          "prevented": 0,
-          "detected": 20,
+          "trials": 12,
+          "prevented": 12,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": ""
+          "passed": 0,
+          "note": "Verification uses the on-chain commitment; the off-chain edit is also flagged by the audit"
         }
       }
     },
     {
       "id": "S4",
-      "title": "Alteration of a supporting evidence file",
-      "attacker": "Attacker with write access to the evidence file store replaces a file's bytes",
+      "title": "Attempted replacement of an earlier commitment",
+      "attacker": "Researcher replaces a committed report through the normal write path",
       "kind": "attack",
       "results": {
         "editable": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
-          "undetected": 0,
-          "protectedRate": 1,
-          "note": "Detected because this baseline also stores SHA-256 digests"
+          "detected": 0,
+          "undetected": 12,
+          "passed": 0,
+          "note": "A conventional edit updates the row in place; the earlier commitment is no longer retrievable"
         },
         "hardened": {
-          "trials": 20,
-          "prevented": 0,
-          "detected": 20,
+          "trials": 12,
+          "prevented": 12,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": ""
+          "passed": 0,
+          "note": "Revision is appended; the original entry stays"
         },
         "hardened-anchored": {
-          "trials": 20,
-          "prevented": 0,
-          "detected": 20,
+          "trials": 12,
+          "prevented": 12,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 0,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
-          "prevented": 0,
-          "detected": 20,
+          "trials": 12,
+          "prevented": 12,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": ""
+          "passed": 0,
+          "note": "reviseCommitment() creates a new commitment; the original keeps its time and can still be opened"
         }
       }
     },
     {
       "id": "S5",
-      "title": "Evidence file and its stored digest replaced together",
-      "attacker": "Attacker with database and file-store access replaces a file and updates the digest stored with it (recomputing that record's own hash where one exists)",
-      "kind": "attack",
+      "title": "Two reports associated with the same issue family by qualified reviewers",
+      "attacker": "Normal workflow: proposal by one program, independent review by the other",
+      "kind": "functional",
       "results": {
         "editable": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
           "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
+          "undetected": 0,
+          "passed": 12,
           "note": ""
         },
         "hardened": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         },
         "hardened-anchored": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         }
       }
     },
     {
       "id": "S6",
-      "title": "Unauthorized role submits a record",
-      "attacker": "A party without the required role (buyer, auditor, unregistered account, or a different repairer correcting someone else's claim) uses the normal write path",
-      "kind": "attack",
+      "title": "Two similar-looking reports classified as distinct",
+      "attacker": "Normal workflow; nothing may be merged automatically",
+      "kind": "functional",
       "results": {
         "editable": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 0,
           "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": "Rejected by application code; relies on every write going through the application"
+          "passed": 12,
+          "note": ""
         },
         "hardened": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 0,
           "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         },
         "hardened-anchored": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 0,
           "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 0,
           "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": "Reverted by the contract (NotAuthorized / NotOriginalActor)"
+          "passed": 12,
+          "note": "Hashes of similar reports are unrelated; only a reviewed SAME_ISSUE association creates a family token"
         }
       }
     },
     {
       "id": "S7",
-      "title": "Insider forges a record in an authorized party's name",
-      "attacker": "Operator of the record store inserts a well-formed repair record attributed to an authorized repairer, without that repairer's key",
+      "title": "Report content disclosed before the process permits it",
+      "attacker": "Reviewer reads before the reveal; researcher reveals before it is requested",
       "kind": "attack",
       "results": {
         "editable": {
-          "trials": 20,
-          "prevented": 0,
+          "trials": 12,
+          "prevented": 12,
           "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
-          "note": ""
+          "undetected": 0,
+          "passed": 0,
+          "note": "Enforced by the same application rule in every design; content is sealed at rest in all of them"
         },
         "hardened": {
-          "trials": 20,
-          "prevented": 0,
+          "trials": 12,
+          "prevented": 12,
           "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
-          "note": "Hash chains without per-party signatures cannot attribute records; the forged record is correctly hashed"
+          "undetected": 0,
+          "passed": 0,
+          "note": ""
         },
         "hardened-anchored": {
-          "trials": 20,
-          "prevented": 0,
+          "trials": 12,
+          "prevented": 12,
           "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
+          "undetected": 0,
+          "passed": 0,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 12,
           "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": "The insider lacks the repairer's key, so the transaction reverts; an off-chain-only row is flagged UNANCHORED_RECORD"
+          "passed": 0,
+          "note": ""
         }
       }
     },
     {
       "id": "S8",
-      "title": "Attempt to hide or overwrite an unresolved dispute",
-      "attacker": "A buyer's challenge is open; the record-store operator tries to make it disappear (status edit, forged resolution, or deletion)",
+      "title": "Unauthorized attempt to change a recorded decision",
+      "attacker": "Operator edits the decision (and covers its tracks) after arbitration",
       "kind": "attack",
       "results": {
         "editable": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
           "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
-          "note": "Dispute status is an editable column"
-        },
-        "hardened": {
-          "trials": 20,
-          "prevented": 0,
-          "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
-          "note": "A correctly hashed resolution forged in the auditor's name is indistinguishable from a real one"
-        },
-        "hardened-anchored": {
-          "trials": 20,
-          "prevented": 0,
-          "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
+          "undetected": 12,
+          "passed": 0,
           "note": ""
         },
+        "hardened": {
+          "trials": 12,
+          "prevented": 0,
+          "detected": 0,
+          "undetected": 12,
+          "passed": 0,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 12,
+          "prevented": 0,
+          "detected": 12,
+          "undetected": 0,
+          "passed": 0,
+          "note": "Rewriting checkpointed entries breaks the externally held head"
+        },
         "blockchain": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 12,
           "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": "Non-auditor resolution reverts; open-dispute state lives in the contract; deleting the off-chain copy is flagged"
+          "passed": 0,
+          "note": "The decision of record is on-chain; editing the off-chain copy is flagged (DISPUTE_MIRROR_ALTERED)"
         }
       }
     },
     {
       "id": "S9",
-      "title": "Reuse of a previously submitted evidence digest",
-      "attacker": "A byte-identical receipt is submitted again for a different device",
-      "kind": "detection",
+      "title": "Dispute followed by a valid appeal",
+      "attacker": "Normal workflow; both rounds must remain retrievable",
+      "kind": "functional",
       "results": {
         "editable": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": "Same digest-lookup query in every store: an analysis feature, not a blockchain property"
+          "passed": 12,
+          "note": "Honest operation keeps the round-1 votes, so both rounds can be reconstructed"
         },
         "hardened": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         },
         "hardened-anchored": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 12,
           "note": ""
         }
       }
     },
     {
       "id": "S10",
-      "title": "Conflicting claims about a component replacement",
-      "attacker": "One repairer records a battery replacement; a later inspection asserts the original battery",
-      "kind": "detection",
+      "title": "Attempt to hide an earlier status event",
+      "attacker": "Operator removes the record of a failed reveal check",
+      "kind": "attack",
       "results": {
         "editable": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
-          "undetected": 0,
-          "protectedRate": 1,
+          "detected": 0,
+          "undetected": 12,
+          "passed": 0,
           "note": ""
         },
         "hardened": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
-          "undetected": 0,
-          "protectedRate": 1,
-          "note": ""
+          "detected": 0,
+          "undetected": 12,
+          "passed": 0,
+          "note": "Consistent deletion renumbers and re-signs the log"
         },
         "hardened-anchored": {
-          "trials": 20,
+          "trials": 12,
           "prevented": 0,
-          "detected": 20,
+          "detected": 12,
           "undetected": 0,
-          "protectedRate": 1,
+          "passed": 0,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
-          "prevented": 0,
-          "detected": 20,
+          "trials": 12,
+          "prevented": 12,
+          "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": ""
+          "passed": 0,
+          "note": "The mismatch count and log entry are on-chain; deleting the off-chain copy is flagged (MIRROR_EVENT_MISSING)"
         }
       }
     },
     {
       "id": "S11",
-      "title": "Correction preserves the earlier claim",
-      "attacker": "The original author corrects a claim through the normal write path; is the original wording still retrievable?",
-      "kind": "preservation",
+      "title": "Conflicted or compromised reviewer attempts to adjudicate",
+      "attacker": "Rotates: conflicted arbitrator; duplicate vote; operator-forged vote",
+      "kind": "attack",
       "results": {
         "editable": {
-          "trials": 20,
-          "prevented": 0,
+          "trials": 12,
+          "prevented": 8,
           "detected": 0,
-          "undetected": 20,
-          "protectedRate": 0,
-          "note": "Conventional CRUD correction overwrites the claim in place"
+          "undetected": 4,
+          "passed": 0,
+          "note": "Conflict and duplicate-vote rules are enforced by every design; only forged attribution separates them"
         },
         "hardened": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 8,
           "detected": 0,
-          "undetected": 0,
-          "protectedRate": 1,
+          "undetected": 4,
+          "passed": 0,
           "note": ""
         },
         "hardened-anchored": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 8,
           "detected": 0,
-          "undetected": 0,
-          "protectedRate": 1,
+          "undetected": 4,
+          "passed": 0,
           "note": ""
         },
         "blockchain": {
-          "trials": 20,
-          "prevented": 20,
+          "trials": 12,
+          "prevented": 12,
           "detected": 0,
           "undetected": 0,
-          "protectedRate": 1,
-          "note": "Correction is a new record; the original is unchanged on- and off-chain"
+          "passed": 0,
+          "note": "The operator has no arbitrator's key, so a forged vote cannot be signed"
+        }
+      }
+    },
+    {
+      "id": "S12",
+      "title": "Receipt presented with missing or mismatched information",
+      "attacker": "Rotates: missing field; altered commitment; holder backdating; operator-issued backdated receipt",
+      "kind": "attack",
+      "results": {
+        "editable": {
+          "trials": 12,
+          "prevented": 0,
+          "detected": 9,
+          "undetected": 3,
+          "passed": 0,
+          "note": "Unsigned receipts are checked against the operator's own database, so an operator-issued backdated receipt passes"
+        },
+        "hardened": {
+          "trials": 12,
+          "prevented": 0,
+          "detected": 9,
+          "undetected": 3,
+          "passed": 0,
+          "note": ""
+        },
+        "hardened-anchored": {
+          "trials": 12,
+          "prevented": 0,
+          "detected": 12,
+          "undetected": 0,
+          "passed": 0,
+          "note": ""
+        },
+        "blockchain": {
+          "trials": 12,
+          "prevented": 0,
+          "detected": 12,
+          "undetected": 0,
+          "passed": 0,
+          "note": "Block times are set by the chain, not by the record-keeping operator"
         }
       }
     }
   ],
+  "scenarioRotation": {
+    "S11": [
+      "conflicted arbitrator votes",
+      "arbitrator votes twice",
+      "operator forges a vote in an arbitrator's name"
+    ],
+    "S12": [
+      "missing field",
+      "altered commitment",
+      "holder backdates the receipt",
+      "operator issues a backdated receipt"
+    ]
+  },
+  "disclosure": [
+    {
+      "item": "Report text found in data shared with other participants",
+      "designs": {
+        "editable": "operator only (not shared)",
+        "hardened": "operator only (signed receipts carry hashes)",
+        "hardened-anchored": "operator only (checkpoints carry one head hash)",
+        "blockchain": "0 of 40 report markers found in all transaction data and logs (control: 40 of 40 commitment hashes found by the same search)"
+      }
+    },
+    {
+      "item": "Secret nonces found in data shared with other participants",
+      "designs": {
+        "editable": "operator only (not shared)",
+        "hardened": "operator only (not shared)",
+        "hardened-anchored": "operator only (not shared)",
+        "blockchain": "0 of 256 nonces found in all transaction data and logs"
+      }
+    },
+    {
+      "item": "Report text readable in the database file without the vault key",
+      "designs": {
+        "editable": "0 of 40",
+        "hardened": "0 of 40",
+        "hardened-anchored": "0 of 40",
+        "blockchain": "0 of 40"
+      }
+    },
+    {
+      "item": "Who can read report text with the vault key",
+      "designs": {
+        "editable": "operator",
+        "hardened": "operator",
+        "hardened-anchored": "operator",
+        "blockchain": "operator of the off-chain store (prototype keeps vaults server-side)"
+      }
+    },
+    {
+      "item": "Commitment hashes and submission times",
+      "designs": {
+        "editable": "operator; receipt holder",
+        "hardened": "operator; receipt holder",
+        "hardened-anchored": "operator; receipt holder",
+        "blockchain": "every consortium node (256 commitments readable from events)"
+      }
+    },
+    {
+      "item": "Same researcher linkable across programs",
+      "designs": {
+        "editable": "operator only (not shared)",
+        "hardened": "operator only (not shared)",
+        "hardened-anchored": "operator only (not shared)",
+        "blockchain": "every consortium node: 3 of 3 researcher addresses appear in more than one program"
+      }
+    },
+    {
+      "item": "Issue-family linkage between submissions",
+      "designs": {
+        "editable": "operator only (not shared)",
+        "hardened": "operator only (not shared)",
+        "hardened-anchored": "operator only (not shared)",
+        "blockchain": "every consortium node (56 family token(s))"
+      }
+    },
+    {
+      "item": "Dispute existence, votes and reason codes",
+      "designs": {
+        "editable": "operator only (not shared)",
+        "hardened": "operator only (not shared)",
+        "hardened-anchored": "operator only (not shared)",
+        "blockchain": "every consortium node (44 disputes)"
+      }
+    }
+  ],
   "notes": [
-    "Measured directly: insert latency (one record, application path, excluding evidence-file upload), full-history verification latency per device, throughput (records ÷ summed insert time, single sequential client), SQLite size, gas and calldata from transaction receipts.",
-    "Simulated: attack outcomes. Each attack is actually executed against the store, then that store's own verifier is run. P = prevented (the operation was rejected), D = applied but detected, U = applied and not detected.",
-    "The local Hardhat chain automines every transaction instantly on one node; real deployments add block/consensus latency (seconds) and replication. Latencies here are lower bounds for the blockchain design.",
-    "Blockchain verification includes RPC reads of the on-chain records and re-hashing of evidence files, so it is not directly comparable to an in-process SQLite scan.",
-    "On-chain bytes per record are computed from the contract's storage layout, not measured from node disk usage.",
-    "Insider model: the attacker controls the off-chain database and file store but not other parties' signing keys. In this prototype the server holds all demo keys for convenience, which a production deployment must not do.",
-    "The hardened baseline with external checkpoints detects rewrites of already-checkpointed history as well as the blockchain does; its remaining gap is attribution (no per-party signatures) and the operator's ability to append records in others' names.",
+    "Measured directly: latency of committing (computing the commitment, sealing the report, recording it; for the blockchain design this includes signing, the RPC round trip and waiting for the receipt), status transitions, reveal checks and receipt verification; throughput = commits / summed commit time for one sequential client; SQLite sizes; gas and calldata from transaction receipts.",
+    "Simulated attacks: each scenario is executed against each design and the design's own verifier then runs. P = prevented (the attacker's goal was rejected), D = applied but detected, U = applied and not detected. Functional scenarios report whether the workflow behaved correctly.",
+    "Insider model: the operator controls the off-chain database, the evidence store, the vault key and (for the hardened designs) the log-signing key, but not other participants' private keys. The prototype server holds all demo keys for convenience; a deployment must not.",
+    "The local Hardhat chain automines each transaction instantly on one node. Real networks add block and consensus latency, so blockchain latencies here are lower bounds.",
+    "Blockchain receipt verification makes about a dozen RPC calls to the node; centralised verification is an in-process lookup. The numbers are not like-for-like.",
+    "On-chain bytes per submission come from the contract's storage layout, not from node disk usage; per-event on-chain storage is one 32-byte log-entry slot plus state updates.",
+    "The disclosure table is computed by scanning the stored data of each design and every transaction input and log on the chain for the synthetic report markers and nonces.",
     "Single run on one machine; results are descriptive. No statistical significance testing was performed; repeat with several seeds to assess variability."
   ]
 }

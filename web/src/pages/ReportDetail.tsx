@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Download, Eye, FileSearch, Gavel, Link2, ShieldCheck } from "lucide-react";
 import { api, downloadJson, type Actor, type AssociationView, type DisputeSummary, type LedgerEvent, type Program } from "../api.ts";
 import { useSession } from "../identity.tsx";
-import { Link } from "../router.tsx";
+import { Link, navigate } from "../router.tsx";
 import { Check, ErrorNotice, Field, Hash, LedgerPanel, Loading, Notice, PageHead, Sealed, Sheet, StateStamp, Withheld, fmtBytes, fmtTime, short, useAction, useLoad } from "../ui.tsx";
 
 export interface ReportView {
@@ -381,7 +381,7 @@ function OpenDispute({ kind, subject, label, reload }: { kind: number; subject: 
         <Field label="Statement (sealed; visible to parties and eligible arbitrators)" htmlFor={`d-${kind}-${subject}`}>
           <textarea id={`d-${kind}-${subject}`} value={text} onChange={(e) => setText(e.target.value)} style={{ minHeight: 60 }} />
         </Field>
-        <button className="btn quiet" disabled={!text.trim() || !!act.busy} onClick={() => act.run("d", () => api.post<{ did: number }>("/api/disputes", { kind, subject, statement: text }), (r) => <Link to={`/disputes/${r.did}`}>Dispute #{r.did} opened on-chain.</Link>).then((x) => x && reload())}>
+        <button className="btn quiet" disabled={!text.trim() || !!act.busy} onClick={() => act.run("d", () => api.post<{ did: number }>("/api/disputes", { kind, subject, statement: text })).then((x) => (x ? navigate(`/disputes/${x.did}`) : reload()))}>
           Open dispute
         </button>
         <ErrorNotice error={act.error} />

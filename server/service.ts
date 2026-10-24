@@ -449,7 +449,7 @@ export class VulnSealService {
   }
 
   /** Create a report, commit to it on-chain and seal it in the researcher's vault. */
-  async commitReport(viewer: Viewer, input: Record<string, unknown>, supersedes?: number) {
+  async commitReport(viewer: Viewer, input: Record<string, unknown>, supersedes?: number, opts: { withReceipt?: boolean } = {}) {
     const programId = int(input.programId, "Program");
     if (!programDef(programId)) throw new ServiceError("Unknown program", 422);
     const evidenceIds = Array.isArray(input.evidenceIds) ? [...new Set(input.evidenceIds.map(String))] : [];
@@ -502,7 +502,8 @@ export class VulnSealService {
       for (const e of ev) this.store.run("UPDATE evidence SET cid = ? WHERE id = ?", cid, e.id);
       if (supersedes) this.store.run("UPDATE reports SET superseded_by = ? WHERE cid = ?", cid, supersedes);
     });
-    return { cid, ref: reportRef(cid), commitment, policyVersion, tx: { hash: tx.hash, blockNumber: tx.blockNumber, gasUsed: tx.gasUsed }, receipt: await this.receipt(viewer, cid) };
+    const receipt = opts.withReceipt === false ? null : await this.receipt(viewer, cid);
+    return { cid, ref: reportRef(cid), commitment, policyVersion, tx: { hash: tx.hash, blockNumber: tx.blockNumber, gasUsed: tx.gasUsed }, receipt };
   }
 
   async reviseReport(viewer: Viewer, cid: number, input: Record<string, unknown>) {

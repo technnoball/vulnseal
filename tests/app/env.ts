@@ -1,33 +1,38 @@
-// Test environment: a dedicated local chain, fresh deployment, temp data dir and the real Express app.
+// Test environment: a dedicated local chain, a fresh consortium, a temp data dir and the
+// real Express app. client(identity) signs in with the demo session cookie.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
 import { createApp } from "../../server/app.ts";
-import { Ledger, deployPatchLedger } from "../../server/chain.ts";
 import { loadConfig } from "../../server/config.ts";
 import { Store } from "../../server/db.ts";
-import { EvidenceVault } from "../../server/evidence.ts";
-import { PatchLedgerService } from "../../server/service.ts";
+import { Keyring } from "../../server/keys.ts";
+import { VulnSealService } from "../../server/service.ts";
+import { Sessions } from "../../server/session.ts";
+import { Vault } from "../../server/vault.ts";
 import { startChain, type ChainProcess } from "../../scripts/lib/chainproc.ts";
+import { initConsortium } from "../../scripts/lib/consortium.ts";
 
 export interface Env {
   base: string;
-  svc: PatchLedgerService;
+  svc: VulnSealService;
   dataDir: string;
   chain: ChainProcess;
   stop: () => Promise<void>;
 }
 
-export async function startEnv(): Promise<Env> {
+export async function startEnv(appealWindowSeconds = 3600): Promise<Env> {
   const chain = await startChain();
-  const { address } = await deployPatchLedger(chain.url);
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "patchledger-test-"));
-  const cfg = { ...loadConfig({ PL_DATA_DIR: dataDir, PL_PORT: "0", PL_RESULTS_DIR: path.join(dataDir, "results") }), webDist: path.join(dataDir, "no-web") };
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "vulnseal-test-"));
+  const cfg = { ...loadConfig({ VS_DATA_DIR: dataDir, VS_PORT: "0", VS_RESULTS_DIR: path.join(dataDir, "results") }), webDist: path.join(dataDir, "no-web") };
   const store = new Store(cfg.dbPath);
-  const ledger = new Ledger(chain.url, address);
-  const svc = new PatchLedgerService(store, ledger, new EvidenceVault(cfg.evidenceDir));
-  const { app } = createApp(svc, cfg);
+  const vault = Vault.open(cfg.keyDir);
+  const keyring = Keyring.generate();
+  const { ledger } = await initConsortium({ rpcUrl: chain.url, keyring, store, appealWindowSeconds });
+  const svc = new VulnSealService({ store, vault, ledger, keyring, evidenceDir: cfg.evidenceDir });
+  await svc.syncLogMirror();
+  const { app } = createApp(svc, Sessions.open(cfg.keyDir), cfg);
   const server: Server = await new Promise((res) => {
     const s = app.listen(0, "127.0.0.1", () => res(s));
   });
@@ -47,30 +52,52 @@ export async function startEnv(): Promise<Env> {
   };
 }
 
-export function client(base: string) {
-  const call = async (method: string, url: string, actor?: string, body?: unknown) => {
+export interface Res {
+  status: number;
+  body: any;
+  headers: Headers;
+}
+
+/** An HTTP client signed in as a demo identity (or anonymous when identity is undefined). */
+export async function client(base: string, identity?: string) {
+  let cookie = "";
+  if (identity) {
+    const r = await fetch(`${base}/api/session`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ identityId: identity }) });
+    cookie = (r.headers.get("set-cookie") ?? "").split(";")[0];
+    if (!cookie) throw new Error(`sign-in as ${identity} failed`);
+  }
+  const call = async (method: string, url: string, body?: unknown): Promise<Res> => {
     const headers: Record<string, string> = {};
-    if (actor) headers["X-Demo-Actor"] = actor;
+    if (cookie) headers.Cookie = cookie;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     const res = await fetch(base + url, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
     const text = await res.text();
-    let json: any = null;
+    let json: any = text;
     try {
       json = JSON.parse(text);
     } catch {
-      json = text;
+      /* not JSON */
     }
     return { status: res.status, body: json, headers: res.headers };
   };
   return {
-    get: (url: string, actor?: string) => call("GET", url, actor),
-    post: (url: string, actor: string | undefined, body: unknown = {}) => call("POST", url, actor, body),
-    upload: async (url: string, actor: string, file: { name: string; type: string; data: Buffer }, fields: Record<string, string> = {}) => {
+    get: (url: string) => call("GET", url),
+    post: (url: string, body: unknown = {}) => call("POST", url, body),
+    raw: (url: string) => fetch(base + url, { headers: cookie ? { Cookie: cookie } : {} }),
+    upload: async (url: string, file: { name: string; type: string; data: Buffer }) => {
       const fd = new FormData();
-      for (const [k, v] of Object.entries(fields)) fd.append(k, v);
       fd.append("file", new Blob([new Uint8Array(file.data)], { type: file.type }), file.name);
-      const res = await fetch(base + url, { method: "POST", headers: { "X-Demo-Actor": actor }, body: fd });
+      const res = await fetch(base + url, { method: "POST", headers: cookie ? { Cookie: cookie } : {}, body: fd });
       return { status: res.status, body: await res.json() };
     },
   };
 }
+
+export const REPORT = {
+  title: "Synthetic test finding: export ignores tenant filter",
+  description: "SYNTHETIC TEST. The fictional export endpoint returns rows of other tenants.",
+  impact: "Fictional cross-tenant exposure.",
+  reproduction: "1. Open the fictional export. 2. Leave the filter empty.",
+  scope: "test.ashgrove.example (fictional)",
+  severity: "high",
+};

@@ -74,6 +74,7 @@ export function Explorer() {
           </Sheet>
           <div className="grid-halves">
             <Sheet tab="Associations" flush>
+              <div className="table-scroll">
               <table className="ledger">
                 <thead>
                   <tr>
@@ -103,8 +104,10 @@ export function Explorer() {
                   ))}
                 </tbody>
               </table>
+              </div>
             </Sheet>
             <Sheet tab="Disputes" flush>
+              <div className="table-scroll">
               <table className="ledger">
                 <thead>
                   <tr>
@@ -131,6 +134,7 @@ export function Explorer() {
                   ))}
                 </tbody>
               </table>
+              </div>
             </Sheet>
           </div>
         </>

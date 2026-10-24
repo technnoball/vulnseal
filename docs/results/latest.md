@@ -1,88 +1,102 @@
-# PatchLedger benchmark report
+# VulnSeal benchmark report
 
-Generated 2026-10-21T18:07:37.133Z · seed 42 · 20 devices × 10 events = 220 records per store · 20 trials per scenario
+Generated 2026-10-24T08:35:12.264Z · seed 42 · 40 synthetic reports · 8 cross-program pairs · 12 trials per scenario
 Environment: Node v24.19.0, darwin/arm64, Apple M4, Hardhat 2.29.1, solc 0.8.28 (optimizer 200 runs)
-
-Workload mix: REGISTRATION 20, COMPONENT_REPLACEMENT 32, REPAIR 53, DIAGNOSTIC 51, INSPECTION 34, CORRECTION 16, CUSTODY_TRANSFER 14; 73 evidence files.
-Baseline verification errors before attacks (expected 0): {"editable":0,"hardened":0,"hardened-anchored":0,"blockchain":0}
 
 ## Performance and storage (direct measurements)
 
-| Store | Insert median ms | Insert p95 ms | Throughput rec/s | Verify median ms | Verify p95 ms | Off-chain B/rec | On-chain B/rec | Calldata B/rec | Mean gas/rec |
-|---|---|---|---|---|---|---|---|---|---|
-| Editable SQLite | 0.074 | 0.116 | 12429 | 0.095 | 0.168 | 577 | — | — | — |
-| Hardened SQLite | 0.065 | 0.117 | 13054 | 0.147 | 0.224 | 875 | — | — | — |
-| Hardened + checkpoints | 0.096 | 0.139 | 9498 | 0.135 | 0.185 | 875 | — | — | — |
-| PatchLedger (local chain) | 16.35 | 17.66 | 62 | 5.93 | 6.56 | 1247 | 133 | 184 | 135580 |
+| Design | Commit median ms | Commit p95 ms | Commits/s | Receipt verify median ms | Transition median ms | Reveal check median ms | Bytes/submission | Bytes/event | On-chain B/submission | Gas/commit |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Editable SQLite | 0.319 | 0.464 | 2937 | 0.010 | 0.080 | 0.412 | 1638 | 234 | — | — |
+| Hardened log | 0.327 | 0.492 | 2738 | 0.063 | 0.086 | 0.352 | 3584 | 512 | — | — |
+| Hardened + checkpoints | 0.357 | 0.556 | 2598 | 11.51 | 0.103 | 0.372 | 3584 | 512 | — | — |
+| VulnSeal (local chain) | 20.11 | 22.01 | 49 | 12.79 | 17.31 | 22.66 | 7782 | 1004 | 224 | 166093 |
 
-p95 is reported only when n ≥ 20. Verification is per device (full history); n = number of devices.
+### Gas by operation (median; deployment 4243209 gas; mean 102034 per transaction)
 
-### Gas by record type (deployment: 1716175 gas)
+| Operation | Median gas |
+|---|---|
+| anchorCommitment | 165666 |
+| acknowledge | 70803 |
+| requestReveal | 70782 |
+| recordReveal | 95832 |
+| setTriage | 73684 |
+| proposeAssociation | 151751 |
+| reviewAssociation | 144333 |
+| openDispute | 235325 |
+| vote | 140559 |
 
-| Record type | n | Median gas |
-|---|---|---|
-| REGISTRATION | 20 | 132175 |
-| COMPONENT_REPLACEMENT | 32 | 133689 |
-| REPAIR | 53 | 133672 |
-| DIAGNOSTIC | 51 | 133655 |
-| INSPECTION | 34 | 133721 |
-| CORRECTION | 16 | 159543 |
-| CUSTODY_TRANSFER | 14 | 133753 |
+## Scenarios (actually executed; attacks are simulated)
 
-## Attack and integrity scenarios (simulated attacks, actually executed)
+Attack cells: protected rate and P/D/U counts. Functional cells: passed/trials.
 
-Cells: protected rate (prevented + detected) and counts P/D/U out of trials. For S11, P means the original claim was preserved.
-
-| Scenario | Editable SQLite | Hardened SQLite | Hardened + checkpoints | PatchLedger (local chain) |
+| Scenario | Editable SQLite | Hardened log | Hardened + checkpoints | VulnSeal (local chain) |
 |---|---|---|---|---|
-| **S1** Unauthorized modification of an existing record | 0% (0P/0D/20U) | 95% (0P/19D/1U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) |
-| **S2** Consistent history rewrite | 0% (0P/0D/20U) | 0% (0P/0D/20U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) |
-| **S3** Deletion of an event record | 95% (0P/19D/1U) | 95% (0P/19D/1U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) |
-| **S4** Alteration of a supporting evidence file | 100% (0P/20D/0U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) |
-| **S5** Evidence file and its stored digest replaced together | 0% (0P/0D/20U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) |
-| **S6** Unauthorized role submits a record | 100% (20P/0D/0U) | 100% (20P/0D/0U) | 100% (20P/0D/0U) | 100% (20P/0D/0U) |
-| **S7** Insider forges a record in an authorized party's name | 0% (0P/0D/20U) | 0% (0P/0D/20U) | 0% (0P/0D/20U) | 100% (20P/0D/0U) |
-| **S8** Attempt to hide or overwrite an unresolved dispute | 0% (0P/0D/20U) | 0% (0P/0D/20U) | 0% (0P/0D/20U) | 100% (20P/0D/0U) |
-| **S9** Reuse of a previously submitted evidence digest | 100% (0P/20D/0U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) |
-| **S10** Conflicting claims about a component replacement | 100% (0P/20D/0U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) | 100% (0P/20D/0U) |
-| **S11** Correction preserves the earlier claim | 0% (0P/0D/20U) | 100% (20P/0D/0U) | 100% (20P/0D/0U) | 100% (20P/0D/0U) |
+| **S1** Valid commitment followed by a matching reveal | 12/12 pass | 12/12 pass | 12/12 pass | 12/12 pass |
+| **S2** Reveal containing modified report material | 100% (0P/12D/0U) | 100% (0P/12D/0U) | 100% (0P/12D/0U) | 100% (0P/12D/0U) |
+| **S3** Operator rewrites a stored commitment so a modified reveal is accepted | 0% (0P/0D/12U) | 0% (0P/0D/12U) | 100% (0P/12D/0U) | 100% (12P/0D/0U) |
+| **S4** Attempted replacement of an earlier commitment | 0% (0P/0D/12U) | 100% (12P/0D/0U) | 100% (12P/0D/0U) | 100% (12P/0D/0U) |
+| **S5** Two reports associated with the same issue family by qualified reviewers | 12/12 pass | 12/12 pass | 12/12 pass | 12/12 pass |
+| **S6** Two similar-looking reports classified as distinct | 12/12 pass | 12/12 pass | 12/12 pass | 12/12 pass |
+| **S7** Report content disclosed before the process permits it | 100% (12P/0D/0U) | 100% (12P/0D/0U) | 100% (12P/0D/0U) | 100% (12P/0D/0U) |
+| **S8** Unauthorized attempt to change a recorded decision | 0% (0P/0D/12U) | 0% (0P/0D/12U) | 100% (0P/12D/0U) | 100% (12P/0D/0U) |
+| **S9** Dispute followed by a valid appeal | 12/12 pass | 12/12 pass | 12/12 pass | 12/12 pass |
+| **S10** Attempt to hide an earlier status event | 0% (0P/0D/12U) | 0% (0P/0D/12U) | 100% (0P/12D/0U) | 100% (12P/0D/0U) |
+| **S11** Conflicted or compromised reviewer attempts to adjudicate | 67% (8P/0D/4U) | 67% (8P/0D/4U) | 67% (8P/0D/4U) | 100% (12P/0D/0U) |
+| **S12** Receipt presented with missing or mismatched information | 75% (0P/9D/3U) | 75% (0P/9D/3U) | 100% (0P/12D/0U) | 100% (0P/12D/0U) |
 
-- **S1** — attacker: Database administrator edits a claim directly (bypassing the app) and recomputes that record's own digest/hash.
-  - Editable SQLite: No integrity metadata covers record content
-  - Hardened SQLite: Edits of the newest record leave no broken link and pass local verification
-- **S2** — attacker: Database administrator edits a claim and recomputes every subsequent hash so the local chain is self-consistent.
-  - Hardened + checkpoints: Detected because the externally held head hash no longer matches
-  - PatchLedger (local chain): Off-chain rewrite detected; the on-chain rewrite attempt reverted (StalePrevHash)
-- **S3** — attacker: Database administrator deletes a record row.
-  - Editable SQLite: Only deletions that leave a sequence gap are noticed; deleting the newest record is not
-  - Hardened SQLite: Deleting the newest record leaves the remaining chain valid
-- **S4** — attacker: Attacker with write access to the evidence file store replaces a file's bytes.
-  - Editable SQLite: Detected because this baseline also stores SHA-256 digests
-- **S5** — attacker: Attacker with database and file-store access replaces a file and updates the digest stored with it (recomputing that record's own hash where one exists).
-- **S6** — attacker: A party without the required role (buyer, auditor, unregistered account, or a different repairer correcting someone else's claim) uses the normal write path.
-  - Editable SQLite: Rejected by application code; relies on every write going through the application
-  - PatchLedger (local chain): Reverted by the contract (NotAuthorized / NotOriginalActor)
-- **S7** — attacker: Operator of the record store inserts a well-formed repair record attributed to an authorized repairer, without that repairer's key.
-  - Hardened SQLite: Hash chains without per-party signatures cannot attribute records; the forged record is correctly hashed
-  - PatchLedger (local chain): The insider lacks the repairer's key, so the transaction reverts; an off-chain-only row is flagged UNANCHORED_RECORD
-- **S8** — attacker: A buyer's challenge is open; the record-store operator tries to make it disappear (status edit, forged resolution, or deletion).
-  - Editable SQLite: Dispute status is an editable column
-  - Hardened SQLite: A correctly hashed resolution forged in the auditor's name is indistinguishable from a real one
-  - PatchLedger (local chain): Non-auditor resolution reverts; open-dispute state lives in the contract; deleting the off-chain copy is flagged
-- **S9** — attacker: A byte-identical receipt is submitted again for a different device.
-  - Editable SQLite: Same digest-lookup query in every store: an analysis feature, not a blockchain property
-- **S10** — attacker: One repairer records a battery replacement; a later inspection asserts the original battery.
-- **S11** — attacker: The original author corrects a claim through the normal write path; is the original wording still retrievable?.
-  - Editable SQLite: Conventional CRUD correction overwrites the claim in place
-  - PatchLedger (local chain): Correction is a new record; the original is unchanged on- and off-chain
+- **S1** — Honest researcher and reviewer.
+- **S2** — Researcher reveals content edited after committing.
+  - Editable SQLite: Commitment check is cryptography, not storage: every design that keeps a commitment detects this
+- **S3** — Operator with database and signing-key access, colluding with the researcher.
+  - Hardened log: The operator holds the signing key, so a consistent rewrite re-signs cleanly
+  - VulnSeal (local chain): Verification uses the on-chain commitment; the off-chain edit is also flagged by the audit
+- **S4** — Researcher replaces a committed report through the normal write path.
+  - Editable SQLite: A conventional edit updates the row in place; the earlier commitment is no longer retrievable
+  - Hardened log: Revision is appended; the original entry stays
+  - VulnSeal (local chain): reviseCommitment() creates a new commitment; the original keeps its time and can still be opened
+- **S5** — Normal workflow: proposal by one program, independent review by the other.
+- **S6** — Normal workflow; nothing may be merged automatically.
+  - VulnSeal (local chain): Hashes of similar reports are unrelated; only a reviewed SAME_ISSUE association creates a family token
+- **S7** — Reviewer reads before the reveal; researcher reveals before it is requested.
+  - Editable SQLite: Enforced by the same application rule in every design; content is sealed at rest in all of them
+- **S8** — Operator edits the decision (and covers its tracks) after arbitration.
+  - Hardened + checkpoints: Rewriting checkpointed entries breaks the externally held head
+  - VulnSeal (local chain): The decision of record is on-chain; editing the off-chain copy is flagged (DISPUTE_MIRROR_ALTERED)
+- **S9** — Normal workflow; both rounds must remain retrievable.
+  - Editable SQLite: Honest operation keeps the round-1 votes, so both rounds can be reconstructed
+- **S10** — Operator removes the record of a failed reveal check.
+  - Hardened log: Consistent deletion renumbers and re-signs the log
+  - VulnSeal (local chain): The mismatch count and log entry are on-chain; deleting the off-chain copy is flagged (MIRROR_EVENT_MISSING)
+- **S11** — Rotates: conflicted arbitrator; duplicate vote; operator-forged vote.
+  - Editable SQLite: Conflict and duplicate-vote rules are enforced by every design; only forged attribution separates them
+  - VulnSeal (local chain): The operator has no arbitrator's key, so a forged vote cannot be signed
+- **S12** — Rotates: missing field; altered commitment; holder backdating; operator-issued backdated receipt.
+  - Editable SQLite: Unsigned receipts are checked against the operator's own database, so an operator-issued backdated receipt passes
+  - VulnSeal (local chain): Block times are set by the chain, not by the record-keeping operator
+
+S11 trials rotate through: conflicted arbitrator votes; arbitrator votes twice; operator forges a vote in an arbitrator's name. S12 trials rotate through: missing field; altered commitment; holder backdates the receipt; operator issues a backdated receipt.
+
+## Disclosure (computed by inspecting stored and on-chain data)
+
+| Item | Editable SQLite | Hardened log | Hardened + checkpoints | VulnSeal (local chain) |
+|---|---|---|---|---|
+| Report text found in data shared with other participants | operator only (not shared) | operator only (signed receipts carry hashes) | operator only (checkpoints carry one head hash) | 0 of 40 report markers found in all transaction data and logs (control: 40 of 40 commitment hashes found by the same search) |
+| Secret nonces found in data shared with other participants | operator only (not shared) | operator only (not shared) | operator only (not shared) | 0 of 256 nonces found in all transaction data and logs |
+| Report text readable in the database file without the vault key | 0 of 40 | 0 of 40 | 0 of 40 | 0 of 40 |
+| Who can read report text with the vault key | operator | operator | operator | operator of the off-chain store (prototype keeps vaults server-side) |
+| Commitment hashes and submission times | operator; receipt holder | operator; receipt holder | operator; receipt holder | every consortium node (256 commitments readable from events) |
+| Same researcher linkable across programs | operator only (not shared) | operator only (not shared) | operator only (not shared) | every consortium node: 3 of 3 researcher addresses appear in more than one program |
+| Issue-family linkage between submissions | operator only (not shared) | operator only (not shared) | operator only (not shared) | every consortium node (56 family token(s)) |
+| Dispute existence, votes and reason codes | operator only (not shared) | operator only (not shared) | operator only (not shared) | every consortium node (44 disputes) |
 
 ## Notes and limitations
 
-- Measured directly: insert latency (one record, application path, excluding evidence-file upload), full-history verification latency per device, throughput (records ÷ summed insert time, single sequential client), SQLite size, gas and calldata from transaction receipts.
-- Simulated: attack outcomes. Each attack is actually executed against the store, then that store's own verifier is run. P = prevented (the operation was rejected), D = applied but detected, U = applied and not detected.
-- The local Hardhat chain automines every transaction instantly on one node; real deployments add block/consensus latency (seconds) and replication. Latencies here are lower bounds for the blockchain design.
-- Blockchain verification includes RPC reads of the on-chain records and re-hashing of evidence files, so it is not directly comparable to an in-process SQLite scan.
-- On-chain bytes per record are computed from the contract's storage layout, not measured from node disk usage.
-- Insider model: the attacker controls the off-chain database and file store but not other parties' signing keys. In this prototype the server holds all demo keys for convenience, which a production deployment must not do.
-- The hardened baseline with external checkpoints detects rewrites of already-checkpointed history as well as the blockchain does; its remaining gap is attribution (no per-party signatures) and the operator's ability to append records in others' names.
+- Measured directly: latency of committing (computing the commitment, sealing the report, recording it; for the blockchain design this includes signing, the RPC round trip and waiting for the receipt), status transitions, reveal checks and receipt verification; throughput = commits / summed commit time for one sequential client; SQLite sizes; gas and calldata from transaction receipts.
+- Simulated attacks: each scenario is executed against each design and the design's own verifier then runs. P = prevented (the attacker's goal was rejected), D = applied but detected, U = applied and not detected. Functional scenarios report whether the workflow behaved correctly.
+- Insider model: the operator controls the off-chain database, the evidence store, the vault key and (for the hardened designs) the log-signing key, but not other participants' private keys. The prototype server holds all demo keys for convenience; a deployment must not.
+- The local Hardhat chain automines each transaction instantly on one node. Real networks add block and consensus latency, so blockchain latencies here are lower bounds.
+- Blockchain receipt verification makes about a dozen RPC calls to the node; centralised verification is an in-process lookup. The numbers are not like-for-like.
+- On-chain bytes per submission come from the contract's storage layout, not from node disk usage; per-event on-chain storage is one 32-byte log-entry slot plus state updates.
+- The disclosure table is computed by scanning the stored data of each design and every transaction input and log on the chain for the synthetic report markers and nonces.
 - Single run on one machine; results are descriptive. No statistical significance testing was performed; repeat with several seeds to assess variability.

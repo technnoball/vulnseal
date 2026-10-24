@@ -1,14 +1,21 @@
-# PatchLedger
+# VulnSeal
 
-**Evidence-Aware and Dispute-Resolvable Blockchain Repair Passports for Refurbished Laptops in India's Multi-Repair Ecosystem.** A runnable, local-only research prototype.
+**Privacy-Preserving Cross-Platform Bug Bounty Priority and Dispute Arbitration Using Blockchain Commitments.** A local-only research prototype.
 
-PatchLedger keeps an append-only, evidence-linked repair history for each laptop. Each history is anchored in a real Solidity contract on a local Ethereum-compatible chain. Repairers, refurbishers, buyers and auditors are separate parties, and the **contract** enforces what each may do.
+VulnSeal is a shared verification and arbitration layer for independent bug bounty programs.
 
-The ledger records *who claimed what, when, and with which evidence file*, and it makes later changes detectable. It does **not** prove that a claim about the physical world is true.
+- **Researchers** commit to confidential reports; only a hash goes on a shared ledger. They reveal the report to the receiving program later.
+- **Anyone** can check that a revealed report is exactly what was committed earlier.
+- **Programs** associate overlapping reports across programs through independent review.
+- **Arbitrators** settle priority and validity disputes in an append-only, attributable record.
 
-> All devices, providers and documents in the demo are **synthetic and fictional**. The keys come from the public Hardhat test mnemonic: **local use only, never on a real network.**
+Report contents, evidence and nonces never go on-chain.
 
-## Quick start
+It is **not** a bug bounty platform, a scanner, an AI detector, a public vulnerability database or a token system. Everything in it is **fictional and synthetic**. Do not enter real undisclosed vulnerabilities.
+
+> A commitment shows that a specific report existed by the time the ledger recorded it. It does **not** show that the report is true, valid or first discovered in the real world, and an arbitrator can still decide wrongly. See [docs/threat-model.md](docs/threat-model.md).
+
+## Start
 
 ```bash
 ./run.sh
@@ -16,121 +23,123 @@ The ledger records *who claimed what, when, and with which evidence file*, and i
 
 The script:
 
-1. checks the prerequisites,
-2. installs dependencies if they are missing,
-3. compiles the contract,
-4. starts a local Hardhat chain,
-5. deploys the contract,
-6. seeds the demo data,
-7. builds and serves the web app,
-8. waits until the app responds,
-9. prints the URLs,
-10. opens your browser.
+1. checks prerequisites;
+2. installs dependencies if needed;
+3. compiles the contract;
+4. starts a local Hardhat chain;
+5. on first run, deploys the contract and seeds fictional programs, researchers, reports, associations and disputes; on later runs, **restores the same ledger** by replaying its transaction journal;
+6. builds the frontend and starts the server;
+7. waits until the app is healthy;
+8. prints the URLs and opens the browser.
 
-The default URL is **http://127.0.0.1:4600**. If ports 4600 or 8545 are busy, the script picks free ports and prints them. Press **Ctrl+C** to stop everything. `./run.sh --no-open` skips opening the browser.
+Open **http://127.0.0.1:4700**. If ports 4700 or 8545 are busy, the script picks free ones and says so. **Ctrl+C** stops everything; your data stays in `data/`.
+
+| Option | Effect |
+|--------|--------|
+| `./run.sh --reset` | Archive the current data and start a fresh, re-seeded ledger |
+| `./run.sh --no-open` | Don't open a browser |
 
 ### Prerequisites
 
-- macOS (Apple Silicon or Intel) or Linux.
-- **Node.js 22.18 or newer** (tested with 24.19). The project uses Node's built-in TypeScript execution and `node:sqlite`, so there is no native build step and no Docker.
-- Internet access **once**, for `npm ci` and so Hardhat can download the solc 0.8.28 compiler. After that everything runs offline.
-- `curl`, which macOS already includes.
+- **macOS (Apple Silicon) or Linux.**
+- **Node.js 22.18+** (tested with 24.19). The project uses Node's built-in TypeScript execution and `node:sqlite`, so it needs no Docker and no native builds.
+- **Internet once**, for `npm ci` and the solc 0.8.28 download. After that it runs offline. No cloud service, API key or wallet is needed.
 
-### State and resets
+## Using it
 
-The Hardhat chain lives in memory. Every `./run.sh` therefore starts a **fresh chain**, archives the previous off-chain data under `data/archive/<timestamp>/`, and reseeds the demo. Records you created in an earlier session remain in the archive, but they are not reloaded, because their on-chain commitments no longer exist.
+Choose an identity in **Signed in as**. This is a *simulated* sign-in: a signed session cookie with no password. The fictional cast:
 
-## What to try (about 5 minutes)
+| Group | Identities |
+|-------|-----------|
+| Researchers | basalt, quillfox, nightjar |
+| Programs | Ashgrove Payments (A), Kestrel Cloud (B), Tamarind Mobile (C) — each has an admin and a triage reviewer |
+| Arbitrators | Holm, Okafor, Vance and Sato (independent); Reyes (affiliated with Ashgrove, so conflicted in Ashgrove disputes) |
+| Other | Auditor (read-only), Consortium desk, Unregistered visitor |
 
-1. Use **Acting as** (top bar) to pick a demo identity. Each one holds different on-chain roles.
-2. **Device passports**: open *HP EliteBook 840 G5*. It shows a battery replacement (#002), a later inspection that claims the original battery (#003, a conflict), and an open buyer challenge (#004). Record #002's receipt is byte-identical to one submitted for the Dell, which triggers a reuse warning.
-3. As **Kiran Bench Repairs**, choose **Record new event**, fill in a repair, upload a file (it is hashed), and commit it. The new record appears marked *anchored on-chain*.
-4. Open an evidence file, then choose **Verify integrity now** to re-hash it and compare it with the on-chain commitment.
-5. As **Demo Buyer**, use **Challenge** on a record. Then try **Resolve dispute**: the contract rejects it with `NotAuthorized`.
-6. Switch to **Open Audit Collective** and resolve the dispute. The original claim, the challenge and the resolution all remain in the history.
-7. In **Audit & export**, the tamper lab can edit or delete a database row or alter an evidence file. The integrity checker flags each change; *Restore all* undoes them. **Attempt on-chain rewrite** sends real transactions, and the contract rejects them.
-8. Use **Export JSON** and verify the file independently:
+**Quickest tour:** open **Demo scenario** and press *Run step* 14 times. Each step performs real contract transactions as the named identities, including four attempts the contract is expected to reject.
 
-   ```bash
-   npm run verify-export -- ~/Downloads/patchledger-<ID>-history.json --rpc http://127.0.0.1:8545
-   ```
+**By hand:**
 
-9. In **Research benchmark**, run the comparison against centralized stores. It uses its own throw-away chain.
-10. **Public verification** (`/verify/<ID>`, also reachable from the QR code) is a read-only view. It never shows evidence contents or free text.
-
-## Evidence categories
-
-| Category | Meaning |
-|----------|---------|
-| Self-reported | No supporting file |
-| Evidence attached | File(s) attached; SHA-256 matches the digest committed on-chain |
-| Independently corroborated | A *different* authorized party recorded a corroboration with its own evidence |
-| Disputed | An unresolved challenge exists |
-| Corrected / superseded | A later correction references the claim (the original stays visible) |
-| Evidence integrity failed | A file no longer matches its committed digest |
-
-A matching digest shows a file is **unchanged since submission**, not that it is genuine.
+1. **Researcher workspace → New confidential report** as basalt. Commit it, then download the receipt and the private reveal package.
+2. Switch to **Ashgrove triage**. On the report, choose **Acknowledge**, then **Request reveal**. The content stays withheld.
+3. Back as basalt, **Reveal**. Try *an edited copy* first: the pre-check says *mismatch*, and when the reviewer verifies it the mismatch is recorded on-chain permanently. Then reveal *the sealed original* and verify it: *match*.
+4. **Propose a cross-program association** (after the other researcher grants disclosure). Only the *other* program can confirm it, which assigns an issue-family token.
+5. Open a **priority dispute** as a party. In **Disputes**:
+   - a non-arbitrator, or the conflicted Reyes, is rejected by the contract;
+   - Holm and Okafor decide;
+   - a party appeals, and Vance and Sato hear it;
+   - both rounds stay on record.
+6. **Cross-program explorer** shows what every participant sees (pseudonyms, hashes, states, no content).
+7. **Audit & verification** (as the auditor) runs the integrity check, exports and attests, and hosts the tamper lab.
+8. **Receipt verifier** checks any receipt against the chain without signing in.
+9. **Research benchmark** runs the comparison against the centralised baselines.
 
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
-| `./run.sh` | Full startup (the only command you need) |
-| `npm test` | Compile, then run contract tests and application/API tests (each against a real local chain) |
-| `npm run test:smoke` | Runs `./run.sh` on isolated ports, checks every service and seeded page, then checks clean shutdown |
-| `npm run typecheck` | TypeScript checks for the server, scripts, tests and web |
-| `npm run benchmark -- --devices 20 --events 10 --seed 42 --trials 20` | Comparative benchmark; writes to `docs/results/` |
-| `npm run ledger [-- --watch]` | Show the raw blockchain: every block, transaction and decoded record; `--watch` follows new blocks live |
-| `npm run integrity [-- PL-XXXX-XXXX]` | Compares the off-chain store and evidence with on-chain commitments, using the running deployment |
-| `npm run verify-export -- <file> [--rpc URL] [--evidence-dir data/evidence]` | Server-independent verification of an export |
-| `npm run dev:web` | Vite dev server with hot reload (proxies `/api` to the running server) |
-
-## Project structure
-
-```
-contracts/PatchLedger.sol     role-based, append-only repair passport contract
-hardhat.config.cjs            compile + local node only (no public networks configured)
-server/                       Express API, domain service, ethers ledger client, SQLite store,
-                              evidence vault, canonical hashing, tamper lab
-web/                          React + Vite frontend; design system in web/src/styles.css
-scripts/                      deploy, seed, benchmark (+ baselines), integrity-check, verify-export
-tests/contract|app|smoke/     automated tests
-docs/                         research-gap, architecture, threat-model, experiment-protocol, results/
-run.sh                        one-command startup
-PROGRESS.md                   build log, test results, limitations
-```
+| `./run.sh` | Start everything (restores existing data) |
+| `npm test` | Contract tests and backend/API tests (16 + 22), each against a real local chain |
+| `npm run test:smoke` | Runs `./run.sh` on isolated ports, creates data, stops, restarts and checks the ledger was restored |
+| `npm run typecheck` | TypeScript checks for server, scripts, tests and web |
+| `npm run benchmark -- --reports 40 --seed 42 --trials 12` | Comparative benchmark → `docs/results/` |
+| `npm run ledger [-- --watch]` | Readable view of every block and log entry on the running chain |
+| `npm run integrity` | Auditor integrity check against the running deployment |
+| `npm run verify-receipt -- receipt.json [--reveal package.json] [--rpc URL]` | Verify a receipt using only the chain |
+| `npm run verify-audit -- audit.json [--rpc URL]` | Re-verify an exported audit report offline |
 
 ## Documentation
 
-- [DEMO.md](DEMO.md): presentation guide (checklist, demo flow, likely questions).
-- [docs/research-gap.md](docs/research-gap.md): related work (verified metadata), the gap, research questions, and what is demonstrated versus hypothesized.
-- [docs/architecture.md](docs/architecture.md): component and data-flow diagrams (Mermaid), hashing, and integrity checks.
-- [docs/threat-model.md](docs/threat-model.md): adversaries, contract-enforced versus application-only protections, privacy, and prototype versus production.
-- [docs/experiment-protocol.md](docs/experiment-protocol.md): benchmark design, metrics, hypotheses, and reproducibility.
-- [docs/results/](docs/results/README.md): generated benchmark output and a summary.
+- [docs/research-gap.md](docs/research-gap.md) — related work (verified sources), candidate contribution, research questions, limitations
+- [docs/architecture.md](docs/architecture.md) — components, data placement, lifecycle state machine (Mermaid), persistence, access control
+- [docs/commitment-protocol.md](docs/commitment-protocol.md) — exact encoding, commitment, receipt, reveal verification
+- [docs/threat-model.md](docs/threat-model.md) — adversaries, contract versus application protections, unsolved problems, privacy
+- [docs/experiment-protocol.md](docs/experiment-protocol.md) and [docs/results/](docs/results/README.md) — benchmark design and measured results
+- [MIGRATION_NOTES.md](MIGRATION_NOTES.md) — what was reused from PatchLedger and how to roll back
+- [DEMO.md](DEMO.md) — presentation guide
+- [PROGRESS.md](PROGRESS.md) — test commands, results, limitations
+
+## When is a shared ledger worth it?
+
+It helps when several programs that don't fully trust one another, or one operator, need the same record:
+
+- who committed what, and when;
+- who was allowed to decide;
+- what was decided.
+
+A **centralised database** is simpler, faster and leaks less metadata. In the benchmark, a hash-chained log with external checkpoints matched the ledger on detecting rewrites. Only per-party signatures enforced outside the operator stopped an operator forging votes in someone else's name.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| `Node.js … is too old` | Install Node 22.18+ (for example `brew install node@24` or the installer from nodejs.org), then re-run. |
-| `contract compilation failed` on first run | Hardhat must download solc 0.8.28 once. Connect to the internet and re-run. The compiler is then cached in `~/Library/Caches/hardhat-nodejs`. |
-| Ports already in use | The script picks free ports automatically and prints them. You can also set `PL_PORT` or `PL_CHAIN_PORT`. |
-| Banner shows "Ledger node unavailable" | The chain process stopped. Check `data/logs/chain.log`, then restart with `./run.sh`. |
-| `database … belongs to contract …` when running `node server/index.ts` by hand | The chain was restarted. Use `./run.sh`, which redeploys and reseeds. |
-| A blank PDF frame in some embedded browsers | Use **Open in new tab** under the viewer. |
-| Logs | `data/logs/{chain,server,compile,web-build}.log` |
+| `Node.js … is too old` | Install Node 22.18+ (e.g. `brew install node@24`) |
+| `contract compilation failed` on first run | solc must be downloaded once: connect to the internet and re-run |
+| `replay diverged …` during startup | The journal and chain don't match (e.g. a manual edit). Run `./run.sh --reset`, which archives the data and starts fresh |
+| `Database belongs to contract …` | Run `./run.sh --reset` |
+| Ports busy | The script picks free ports and prints them; or set `VS_PORT` / `VS_CHAIN_PORT` |
+| "ledger node unavailable" in the sidebar | The chain process stopped; see `data/logs/chain.log`, then restart with `./run.sh` |
 
 ## Configuration
 
-These environment variables are all optional and none is secret, so there is no `.env` file:
+These environment variables are all optional and none is secret:
 
-- `PL_PORT` (default 4600)
-- `PL_CHAIN_PORT` (default 8545)
-- `PL_DATA_DIR` (default `data`)
-- `PL_DEMO_LAB=0` disables the tamper lab
-- `PL_NO_OPEN=1` skips opening the browser
+| Variable | Default |
+|----------|---------|
+| `VS_PORT` | `4700` |
+| `VS_CHAIN_PORT` | `8545` |
+| `VS_DATA_DIR` | `data` |
+| `VS_DEMO_LAB` | `1` (set to `0` to disable the tamper lab) |
+| `VS_NO_OPEN` | unset (set to `1` to skip opening the browser) |
 
-## Status and limitations
+Keys are generated locally into `data/keys/` (mode 0600). Never put real keys or seed phrases anywhere in this project.
 
-This is a research prototype. It has no user study, real repair data, partnership, security audit or regulatory compliance claim. Demo identities are chosen with a request header (no authentication), and the server holds every demo key. See the threat model and `PROGRESS.md` for the full list.
+## Status
+
+Research prototype on a single local chain:
+
+- Sign-in is simulated, and the server holds every demo key.
+- The vault key sits on the server.
+- There is no audit, user study, field data or compliance claim.
+
+See the threat model and `PROGRESS.md`.

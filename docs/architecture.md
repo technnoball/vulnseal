@@ -1,133 +1,155 @@
 # Architecture
 
-PatchLedger runs entirely on `127.0.0.1`. It has three parts: a local Hardhat chain with the `PatchLedger` Solidity contract, one Node.js process serving both the Express API and the built React app, and local storage (SQLite plus an evidence directory).
+VulnSeal runs entirely on `127.0.0.1`. It has three parts:
 
-## Component diagram
+- a local Hardhat chain with the `VulnSeal` contract;
+- one Node.js process serving both the Express API and the built React app;
+- a local data directory: SQLite, an encrypted vault for reports and evidence, a key store, and the transaction journal.
+
+## Components
 
 ```mermaid
 flowchart LR
-  subgraph Browser["Browser (React + Vite build)"]
-    UI["Pages: Overview · Passports · Register · Record event<br/>Evidence viewer · Disputes · Audit & tamper lab<br/>Research benchmark · Public verify"]
+  subgraph Browser["Browser — React + Vite (web/)"]
+    UI["Overview · Researcher workspace · Program workspace · Cross-program explorer<br/>Disputes & arbitration · Audit & verification · Receipt verifier · Demo · Research"]
   end
 
-  subgraph Server["Node.js server (server/index.ts, 127.0.0.1:4600)"]
-    API["Express API<br/>server/app.ts"]
-    SVC["Domain service<br/>server/service.ts<br/>canonical payloads · status · conflicts · integrity · export"]
-    LED["Ledger client (ethers v6)<br/>server/chain.ts<br/>demo-identity signers · tx queue · revert decoding"]
-    LAB["Tamper lab (demo only)<br/>server/lab.ts"]
+  subgraph Server["Node.js server — 127.0.0.1:4700 (server/)"]
+    API["Express API (app.ts)<br/>simulated sign-in: HMAC session cookie (session.ts)"]
+    SVC["Domain service (service.ts)<br/>commit · reveal · triage · associate · dispute<br/>server-side access control on every confidential read"]
+    COM["Commitment module (commitment.ts)<br/>field hashing · nonce · reveal checks · digests"]
+    INT["Auditor integrity check (integrity.ts)"]
+    DEMO["Demo runner (demo.ts) · tamper lab (lab.ts)"]
+    LED["Ledger client (chain.ts)<br/>local signing · tx queue · revert decoding"]
+    JNL["Transaction journal (journal.ts)"]
   end
 
-  subgraph Storage["Local storage (data/)"]
-    DB[("SQLite<br/>patchledger.sqlite<br/>devices · events · evidence")]
-    EV[["Evidence files<br/>data/evidence/"]]
+  subgraph Data["data/ (gitignored)"]
+    DB[("SQLite vulnseal.sqlite<br/>sealed reports, reveals, notes, rationales<br/>log mirror · access log")]
+    EV[["evidence/*.sealed<br/>AES-256-GCM"]]
+    KEYS[["keys/ master.key · session.key<br/>identities.sealed"]]
+    J[["chain/journal.jsonl<br/>raw signed transactions"]]
   end
 
-  subgraph Chain["Hardhat node (127.0.0.1:8545, in-memory)"]
-    SC["PatchLedger.sol<br/>roles · append-only records · disputes · verifyChain()"]
+  subgraph Chain["Hardhat node — 127.0.0.1:8545"]
+    SC["VulnSeal.sol<br/>roles · commitments · state machine · associations<br/>disputes (2-of-N, recusal, appeal) · hash-chained log"]
   end
 
-  BENCH["scripts/benchmark.ts<br/>own throw-away chain + baselines"]
-  CLI["scripts/integrity-check.ts<br/>scripts/verify-export.ts"]
+  CLI["CLIs: verify-receipt · verify-audit · integrity · ledger"]
+  BENCH["Benchmark (scripts/benchmark.ts)<br/>own throw-away chain + centralised baselines"]
 
-  UI -- "HTTP JSON + X-Demo-Actor" --> API
+  UI -- "HTTPS-less local HTTP + cookie" --> API
   API --> SVC
-  API --> LAB
+  SVC --> COM
   SVC --> LED
   SVC --> DB
   SVC --> EV
-  LAB --> DB
-  LAB --> EV
-  LED -- "JSON-RPC (signed tx / eth_call)" --> SC
+  SVC -. "vault" .-> KEYS
+  INT --> DB
+  INT --> LED
+  DEMO --> SVC
+  LED -- "signed tx / eth_call" --> SC
+  LED --> JNL --> J
   CLI --> SC
-  CLI --> DB
   API -- "spawns" --> BENCH
 ```
 
-## What is stored where
+## Data placement
 
-| Data | Where | Why |
-|------|-------|-----|
-| Opaque device key `keccak256("patchledger:device:" + publicId)` | chain | Shared identifier that contains no serial number |
-| Record hash, previous hash, payload digest, actor address, block timestamp, sequence, type, reference, outcome | chain (one `Record` struct, 4 storage slots) | Integrity, provenance and ordering that the contract enforces |
-| Open-dispute and supersession state | chain (mappings) | So nobody can hide disputes or corrections off-chain |
-| Full canonical payload (description, component, result, measurements, evidence list, nonce) | SQLite `events.payload` | Detail and privacy; committed by the on-chain digest |
-| Device brand, model, year | SQLite `devices`, and inside the committed registration payload | Display; edits are detectable |
-| Evidence bytes | `data/evidence/<id>.<ext>` | Never on-chain |
-| Evidence SHA-256, uploader, access level | SQLite `evidence`; the digest is also inside the committed payload | Re-verification and access control |
+| Data | Where | Who can read it |
+|------|-------|-----------------|
+| Commitment hash, researcher address, program id, policy version, block time, status, mismatch count, reveal digest, issue-family token | Contract state, plus events | Every participant of the network |
+| Hash-chained log (kind, subject, actor, time, data hash) | Contract (`logEntries`, `logHead`), plus `LogAppended` events | Every participant |
+| Program name tags and policy digests | Contract | Every participant (policy text is off-chain) |
+| Report text, nonce, private notes | `reports.sealed` (vault, AAD `report:<id>`) | The researcher (and the operator holding the vault key) |
+| Revealed copy of a report | `reveals.sealed` | The receiving program; programs granted on-chain disclosure; unconflicted arbitrators of an active dispute |
+| Evidence bytes and file names | `evidence/*.sealed`, `evidence.sealed_name` | Same as the report. The SHA-256 is part of the commitment |
+| Rationales, statements, triage notes | `associations` / `disputes` / `dispute_acts` / `notes` (sealed); salted digest on-chain | Parties to the dispute, eligible arbitrators, staff of the involved programs |
+| Payout identity of researchers | `identity_private` (sealed) | The researcher only |
+| Content access log | `access_log` | The auditor |
 
-## Hashing and canonical serialization
-
-- **Canonical payload** ([`server/canonical.ts`](../server/canonical.ts)): keys sorted, no whitespace, strings NFC-normalized, integers only (floats are rejected), keys with value `undefined` omitted. Every payload carries a random 128-bit `nonce`, so short or predictable payloads cannot be guessed from their on-chain digest.
-- **Payload digest** = `keccak256(utf8(canonical))`.
-- **Record hash**, computed by the contract and re-implemented in [`server/ledger-hash.ts`](../server/ledger-hash.ts):
-  `keccak256(abi.encode(keccak256("PatchLedger.Record.v1"), chainId, contract, deviceKey, seq, type, prevHash, payloadDigest, actor, timestamp, refSeq, outcome))`
-- **Evidence digest** = SHA-256 of the raw file bytes (hex). It is committed indirectly because it sits inside the payload.
-
-## Data flow: recording a repair with evidence
+## Lifecycle state machine
 
 ```mermaid
-sequenceDiagram
-  participant U as User (demo identity)
-  participant A as API / service
-  participant F as Evidence dir + SQLite
-  participant C as PatchLedger contract
-  U->>A: POST /devices/:id/evidence (file)
-  A->>F: store bytes, SHA-256, evidence row (unlinked)
-  A-->>U: evidence id + digest (+ reuse warning)
-  U->>A: POST /devices/:id/events {type, fields, evidenceIds, expectedPrevHash}
-  A->>F: check evidence: same device, same uploader, unlinked, digest still matches
-  A->>A: build payload → canonicalize → keccak256
-  A->>C: appendRecord(deviceKey, type, expectedPrevHash, digest, refSeq, outcome) signed by identity
-  C->>C: role + reference rules, prev == head, compute recordHash, push
-  alt rejected
-    C-->>A: revert NotAuthorized / StalePrevHash / SelfResolution …
-    A-->>U: 403/409 with decoded contract error (nothing stored)
-  else accepted
-    C-->>A: receipt + RecordAppended(seq, recordHash)
-    A->>F: insert event row, link evidence (one SQLite transaction)
-    A-->>U: 201 {seq, tx}
-  end
+stateDiagram-v2
+  direction LR
+  [*] --> Anchored: anchorCommitment (researcher)
+  Anchored --> Acknowledged: acknowledge (program staff)
+  Acknowledged --> RevealRequested: requestReveal (program staff)
+  RevealRequested --> RevealRequested: recordReveal MISMATCH / MISSING / BAD_ENCODING (mismatches += 1)
+  RevealRequested --> Revealed: recordReveal MATCH (reviewer, not the researcher)
+  Revealed --> PendingTriage: setTriage
+  PendingTriage --> NeedsInfo: setTriage
+  PendingTriage --> Valid: setTriage
+  PendingTriage --> Invalid: setTriage
+  NeedsInfo --> PendingTriage: setTriage
+  NeedsInfo --> Valid: setTriage
+  NeedsInfo --> Invalid: setTriage
+  Valid --> Invalid: validity dispute decided "invalid"
+  Invalid --> Valid: validity dispute decided "valid"
+  Valid --> Finalized: finalizeReport (admin, no open dispute)
+  Invalid --> Finalized: finalizeReport (admin, no open dispute)
+  Anchored --> Superseded: reviseCommitment (owner) → new commitment
+  Acknowledged --> Superseded
+  RevealRequested --> Superseded
+  Finalized --> [*]
+
+  state Dispute {
+    direction LR
+    [*] --> Open: openDispute (party)
+    Open --> Decided: 2 matching votes (unconflicted arbitrators)
+    Decided --> Appealed: appeal (party, within window)
+    Appealed --> Final: 2 matching votes (fresh panel)
+    Decided --> Final: closeDispute (after window)
+  }
 ```
 
-The chain write happens **before** the database write. If the server crashed between the two, the integrity checker would report `OFFCHAIN_RECORD_MISSING`; nothing would pass silently.
+`Superseded` is not a status field. It is the `supersededBy` reference: the original keeps its status and stays on record, and the contract refuses further actions on it. Associations follow `Proposed → Confirmed | Rejected` (review by the *other* program), then `→ Disputed → Upheld | Overturned` (arbitration). A same-issue relation that is confirmed or upheld assigns an issue-family token.
 
-## Integrity checker
+## Write path: commit, then reveal
 
-`PatchLedgerService.checkIntegrity`, exposed by the UI, `GET /api/devices/:id/integrity` and `npm run integrity`, checks:
+1. The researcher submits the report form. The server hashes each field, combines the result with the evidence SHA-256 root, draws a 256-bit nonce, and computes the commitment.
+2. The ledger client signs `anchorCommitment` with the researcher's key, broadcasts it, waits for the receipt and appends the raw transaction to the journal.
+3. The report and nonce are sealed in the vault, the off-chain row is written, and the `LogAppended` event is mirrored.
+4. The program's staff acknowledge and request a reveal, each as its own transaction.
+5. The researcher reveals: the server builds the package from the vault, an uploaded recovery package or an edited copy, and runs a pre-check. The package is stored sealed and becomes readable by the program's staff.
+6. The reviewer verifies: a local check plus `verifyOpening` by `eth_call`, then `recordReveal(outcome, revealDigest)` as a transaction.
 
-1. On-chain records recompute locally and link correctly; the contract's `verifyChain()` agrees.
-2. Every on-chain record has an off-chain row (`OFFCHAIN_RECORD_MISSING`), and every off-chain row has an on-chain record (`UNANCHORED_RECORD`).
-3. Each stored payload is canonical and its digest equals the on-chain `payloadDigest` (`PAYLOAD_DIGEST_MISMATCH`). Record hash, actor, type, reference and outcome agree.
-4. Each evidence file re-hashes to the SHA-256 committed in its payload (`EVIDENCE_FILE_ALTERED` or `_MISSING`), and the database digest was not edited (`EVIDENCE_DIGEST_EDITED`).
-5. Device metadata matches the committed registration payload (`DEVICE_METADATA_EDITED`).
-6. Reused evidence digests produce warnings (`EVIDENCE_DIGEST_REUSED`).
+## Persistence across restarts
 
-`scripts/verify-export.ts` repeats steps 1, 3 and 4 from an exported JSON file. It can optionally check the live chain (`--rpc`) and the evidence files (`--evidence-dir`), and it does not need the PatchLedger server.
+A Hardhat node keeps its state in memory. VulnSeal makes the ledger survive restarts by **journaling every raw signed transaction**, together with its block number and timestamp, and **replaying** the journal into a fresh node:
 
-## Evidence-status derivation
+- The node starts with its clock at 2020-01-01, so original block times can be re-applied with `evm_setNextBlockTimestamp`.
+- After the replay, an empty block moves the clock to the present.
+- The replay checks every transaction hash and block number. The tests check that **every block hash is identical** after a restart.
+- `bootstrap.ts` then compares the on-chain log head with the off-chain mirror.
 
-The status is computed per claim, in order of precedence:
+`./run.sh --reset` archives the data directory and starts a new ledger.
 
-1. **Disputed:** an unresolved challenge exists.
-2. **Corrected / superseded:** a correction references the claim.
-3. **Evidence integrity failed:** an attached file no longer matches its committed digest.
-4. **Independently corroborated:** a corroboration record exists, from an actor *different* from the claim's author, with at least one evidence file whose digest matches.
-5. **Evidence attached:** at least one evidence file exists and all match.
-6. **Self-reported:** no evidence.
+## Access control (server-side)
 
-Further flags: a claim rejected by an auditor, reused digests, corroboration without evidence, conflicting component claims, and off-chain/on-chain mismatch.
+Every confidential read goes through `contentAccess(viewer, cid)` in the service:
+
+- **Owner:** the sealed original.
+- **Staff of the receiving program:** the revealed copy, only after a reveal exists.
+- **Staff of another program:** the revealed copy, only if the contract has `disclosedTo[cid][program]`.
+- **Arbitrator:** the revealed copy, only while an active dispute involving the report is open and the arbitrator is not affiliated with an involved program.
+- **Auditor:** never content.
+
+Denied and allowed reads are logged. Report ids are sequential, so ID-guessing attacks are explicitly tested.
+
+**Demo identity selection is simulated.** Choosing an identity issues an HMAC-signed cookie with no password. The contract still checks the signer of every transaction.
 
 ## Repository layout
 
 ```
-contracts/PatchLedger.sol      Solidity contract
-hardhat.config.cjs             compile + local node config (no public networks)
-server/                        API, service, ledger client, store, evidence, tamper lab
-web/                           React + Vite frontend (design system in web/src/styles.css)
-scripts/                       deploy, seed, benchmark, integrity-check, verify-export, lib/
-tests/contract/                contract tests (real local chain)
-tests/app/                     API/service tests (real chain + Express)
-tests/smoke/                   ./run.sh startup and shutdown test
-docs/                          research documents and generated results
-run.sh                         one-command startup
+contracts/VulnSeal.sol           contract
+server/                          API, service, commitment, receipt, integrity, vault, journal, keys, sessions, demo, lab
+web/                             React + Vite frontend (design system in web/src/styles.css, icons from lucide-react)
+scripts/bootstrap.ts             initialise or restore the ledger (used by run.sh)
+scripts/seed.ts                  fictional programs, researchers, reports, associations, disputes
+scripts/benchmark.ts             comparative benchmark; scripts/lib/baselines.ts holds the centralised designs
+scripts/verify-receipt.ts, verify-audit.ts, integrity-check.ts, show-chain.ts   independent CLIs
+tests/contract, tests/app, tests/smoke                                            automated tests
+docs/                            research documents, results, PatchLedger archive
 ```

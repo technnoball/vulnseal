@@ -1386,3 +1386,7 @@ ul.checklist li {
   margin-top: 3px;
   flex: none;
 }
+ul.checklist li > * {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

@@ -63,8 +63,8 @@ export async function anchor(ledger: Ledger, researcher: string, programId: numb
 }
 
 /** Walk a commitment through acknowledge -> request reveal -> matching reveal check. */
-export async function reveal(ledger: Ledger, a: { cid: number; digest: string }, reviewer: string) {
+export async function reveal(ledger: Ledger, a: { cid: number; digest: string; nonce: string }, reviewer: string) {
   await ledger.send(reviewer, "acknowledge", [a.cid]);
   await ledger.send(reviewer, "requestReveal", [a.cid]);
-  await ledger.send(reviewer, "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest)]);
+  await ledger.send(reviewer, "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest, a.nonce)]);
 }

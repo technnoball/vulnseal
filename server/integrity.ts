@@ -144,6 +144,15 @@ export async function auditReport(svc: VulnSealService) {
     if (!ev || ev.dataHash !== want) add("error", "RATIONALE_NOT_ANCHORED", subj, "vote record differs from the on-chain record");
   }
 
+  // 7. mirrored dispute and association state must agree with the chain
+  const disputes = new Map(snap.disputes.map((d) => [d.did, d]));
+  for (const d of store.all("SELECT did, status, decision, reason_code FROM disputes")) {
+    const c = disputes.get(d.did);
+    if (!c) add("error", "UNANCHORED_DISPUTE", `dispute #${d.did}`, "off-chain dispute has no on-chain record");
+    else if ((d.decision ?? 0) !== c.decision || (d.reason_code ?? 0) !== c.reasonCode || d.status !== c.status)
+      add("error", "DISPUTE_MIRROR_ALTERED", `dispute #${d.did}`, "off-chain decision or status differs from the on-chain decision");
+  }
+
   return {
     format: AUDIT_FORMAT,
     generatedAt: new Date().toISOString(),

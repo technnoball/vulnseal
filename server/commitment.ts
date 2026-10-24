@@ -54,8 +54,13 @@ export function computeCommitment(ctx: CommitContext, digest: string, nonce: str
 
 export const newNonce = () => hexlify(randomBytes(32));
 
-export function revealDigest(cid: number, digest: string): string {
-  return keccak256(coder.encode(["bytes32", "uint64", "bytes32"], [REVEAL_TAG, cid, digest]));
+/**
+ * Recorded on-chain when a reveal is checked. It includes the secret nonce (hashed, never
+ * disclosed) so that nobody without the reveal package can use it to test guesses about
+ * the report's content.
+ */
+export function revealDigest(cid: number, digest: string, nonce: string): string {
+  return keccak256(coder.encode(["bytes32", "uint64", "bytes32", "bytes32"], [REVEAL_TAG, cid, digest, nonce]));
 }
 
 /** Salted digest for free text recorded on-chain (rationales, claims), so short texts can't be guessed. */
@@ -138,7 +143,7 @@ export function checkReveal(pkg: unknown, anchored: { cid: number; commitment: s
   if (missing.length) return { outcome: "missing", missing };
   const digest = fieldsDigest(r as ReportFields);
   const recomputed = computeCommitment(anchored, digest, p.nonce);
-  const rd = revealDigest(anchored.cid, digest);
+  const rd = revealDigest(anchored.cid, digest, p.nonce);
   return recomputed === anchored.commitment
     ? { outcome: "match", fieldsDigest: digest, commitment: recomputed, revealDigest: rd }
     : { outcome: "mismatch", fieldsDigest: digest, commitment: recomputed, expected: anchored.commitment, revealDigest: rd };

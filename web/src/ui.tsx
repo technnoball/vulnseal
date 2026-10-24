@@ -165,7 +165,7 @@ export function ErrorNotice({ error }: { error: unknown }) {
     e.onChain && e.status === 403 ? "Rejected by the smart contract." : e.onChain ? "The contract refused this." : e.status === 403 ? "Not permitted." : e.status === 401 ? "No identity selected." : e.status === 503 ? "Service unavailable." : e.status === 409 ? "Not possible right now." : "Error.";
   return (
     <Notice kind="error" title={title}>
-      {e.message}
+      {e.onChain ? e.message.replace(/^Rejected by the contract: /, "") : e.message}
       {e.contractError && (
         <span className="code">
           revert {e.contractError.name}({e.contractError.args.join(", ")})

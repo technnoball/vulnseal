@@ -1,25 +1,30 @@
-// Comparative benchmark: editable SQLite vs hardened (append-only, hash-chained)
-// SQLite (with and without external checkpoints) vs the real PatchLedger
-// contract on a dedicated, throw-away local Hardhat chain.
+// VulnSeal comparative benchmark.
+//   editable           conventional, editable SQLite submission record
+//   hardened           append-only, hash-chained, operator-signed SQLite log
+//   hardened-anchored  as hardened, plus head checkpoints held by an independent party
+//   blockchain         the real VulnSeal contract and service on a throw-away local chain
 //
-// Usage: node scripts/benchmark.ts [--devices 10] [--events 8] [--seed 42] [--trials 10] [--out docs/results]
+// Usage: node scripts/benchmark.ts [--reports 40] [--seed 42] [--trials 10] [--out docs/results]
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createRequire } from "node:module";
-import { Ledger, deployPatchLedger } from "../server/chain.ts";
+import { hexlify } from "ethers";
+import type { Ledger } from "../server/chain.ts";
+import { REPORT_SCHEMA, REVEAL_FORMAT, computeCommitment, fieldsDigest, type ReportFields } from "../server/commitment.ts";
 import { Store } from "../server/db.ts";
-import { COMPONENTS, typeCode, type RecordType } from "../server/domain.ts";
-import { EvidenceVault } from "../server/evidence.ts";
+import { DECISION, DISPUTE_KIND, RELATION, ST } from "../server/domain.ts";
+import { Keyring } from "../server/keys.ts";
 import { TamperLab } from "../server/lab.ts";
-import { NO_REF } from "../server/ledger-hash.ts";
-import { sha256Hex as sha } from "../server/canonical.ts";
-import { PatchLedgerService, type EventInput } from "../server/service.ts";
+import { verifyReceipt as verifyChainReceipt } from "../server/receipt.ts";
+import { VulnSealService, type Viewer } from "../server/service.ts";
+import { Vault } from "../server/vault.ts";
+import { EditableDesign, HardenedDesign, OFFCHAIN_CHAIN_ID, OPERATOR_CONTRACT, Rejected, type CentralDesign, type Receipt } from "./lib/baselines.ts";
 import { startChain } from "./lib/chainproc.ts";
-import { EditableStore, HardenedStore, Unauthorized, type Finding } from "./lib/baselines.ts";
+import { initConsortium } from "./lib/consortium.ts";
 
-// ------------------------------------------------------------------ args
+// ------------------------------------------------------------------ arguments
 const argv = process.argv.slice(2);
 const num = (name: string, def: number) => {
   const i = argv.indexOf("--" + name);
@@ -28,15 +33,13 @@ const num = (name: string, def: number) => {
   if (!Number.isInteger(v) || v < 1) throw new Error(`--${name} must be a positive integer`);
   return v;
 };
-const DEVICES = num("devices", 10);
-const EVENTS = num("events", 8);
+const REPORTS = num("reports", 40);
 const SEED = num("seed", 42);
 const TRIALS = num("trials", 10);
-const outIdx = argv.indexOf("--out");
-const OUT = path.resolve(outIdx >= 0 ? argv[outIdx + 1] : "docs/results");
+const OUT = path.resolve(argv.includes("--out") ? argv[argv.indexOf("--out") + 1] : "docs/results");
 const log = (...a: unknown[]) => console.log("[bench]", ...a);
 
-// ------------------------------------------------------------------ RNG
+// ------------------------------------------------------------------ seeded RNG and workload
 function mulberry32(seed: number) {
   let a = seed >>> 0;
   return () => {
@@ -50,70 +53,40 @@ function mulberry32(seed: number) {
 const rng = mulberry32(SEED);
 const pick = <T,>(xs: readonly T[]) => xs[Math.floor(rng() * xs.length)];
 const hex = (n: number) => Array.from({ length: n }, () => Math.floor(rng() * 16).toString(16)).join("");
+const RESEARCHERS = ["basalt", "quillfox", "nightjar"] as const;
+const TRIAGE = { 1: "ashgrove-triage", 2: "kestrel-triage", 3: "tamarind-triage" } as Record<number, string>;
+const COMPONENTS = ["export endpoint", "session handling", "upload worker", "share links", "password reset mail", "image parser", "coupon field"];
+const FLAWS = ["ignores the tenant filter", "keeps sessions after logout", "hangs on oversized metadata", "reflects input without encoding", "exposes full account numbers"];
 
-// ------------------------------------------------------------------ workload
-interface Item {
-  idx: number;
-  device: number;
-  type: RecordType;
-  actor: string;
-  input: EventInput & { brand?: string; model?: string; year?: number };
-  refIdx?: number;
-  evidence?: Buffer;
+function syntheticReport(i: number, similarTo?: ReportFields): ReportFields {
+  const token = `ref-${hex(10)}`;
+  if (similarTo) return { ...similarTo, title: `${similarTo.title.replace(/ref-[0-9a-f]+/, token)}`, scope: `${similarTo.scope} (other deployment)` };
+  const comp = pick(COMPONENTS);
+  const flaw = pick(FLAWS);
+  return {
+    title: `Synthetic finding ${i}: ${comp} ${flaw} [${token}]`,
+    description: `SYNTHETIC BENCHMARK REPORT ${token}. The fictional ${comp} ${flaw}. ${hex(40)}`,
+    impact: `Fictional impact for ${token}.`,
+    reproduction: `1. Open the fictional ${comp}. 2. Trigger the condition. 3. Observe. (${token})`,
+    scope: `${comp.replace(/ /g, "-")}.bench.example (fictional)`,
+    severity: pick(["low", "medium", "high"]),
+    evidence: [],
+  };
 }
-const BRANDS: [string, string][] = [["Lenovo", "ThinkPad T470"], ["Dell", "Latitude 5490"], ["HP", "ProBook 440 G6"], ["Acer", "TravelMate P2"], ["ASUS", "ExpertBook B1"]];
-const CATS = ["battery", "power", "storage", "memory", "display", "keyboard", "thermal", "board-level", "chassis", "general"];
-const REPLACEABLE = ["battery", "storage", "display", "keyboard", "memory", "fan"] as const;
 
-function genWorkload(): Item[] {
-  const items: Item[] = [];
-  for (let d = 0; d < DEVICES; d++) {
-    const [brand, model] = pick(BRANDS);
-    items.push({ idx: items.length, device: d, type: "REGISTRATION", actor: "registrar", input: { type: "REGISTRATION", brand, model, year: 2017 + Math.floor(rng() * 6) } });
-    const claims: number[] = [];
-    const corrected = new Set<number>();
-    for (let k = 0; k < EVENTS; k++) {
-      const day = new Date(Date.UTC(2024, 0, 1) + Math.floor(rng() * 600) * 86400000).toISOString().slice(0, 10);
-      const r = rng();
-      const correctable = claims.filter((c) => !corrected.has(c));
-      if (r < 0.08 && correctable.length) {
-        const t = pick(correctable);
-        corrected.add(t);
-        items.push({
-          idx: items.length,
-          device: d,
-          type: "CORRECTION",
-          actor: items[t].actor,
-          refIdx: t,
-          input: { type: "CORRECTION", reason: `Synthetic correction of an earlier entry (benchmark item ${t}).`, description: `Corrected synthetic description ${hex(8)}`, result: "pass" },
-        });
-        continue;
-      }
-      const type: RecordType = r < 0.35 ? "DIAGNOSTIC" : r < 0.6 ? "REPAIR" : r < 0.75 ? "COMPONENT_REPLACEMENT" : r < 0.92 ? "INSPECTION" : "CUSTODY_TRANSFER";
-      const actor = type === "INSPECTION" ? "inspector" : type === "CUSTODY_TRANSFER" ? pick(["registrar", "inspector"]) : pick(["repairer-a", "repairer-b", "inspector"]);
-      const component = type === "COMPONENT_REPLACEMENT" ? pick(REPLACEABLE) : pick(COMPONENTS);
-      const input: EventInput = { type, claimedAt: day };
-      if (type === "CUSTODY_TRANSFER") Object.assign(input, { fromParty: "Synthetic reseller", toParty: "Synthetic buyer (not recorded)" });
-      else {
-        Object.assign(input, {
-          category: pick(CATS),
-          component,
-          description: `Synthetic ${type.toLowerCase()} entry ${hex(12)} for benchmark device ${d}.`,
-          result: type === "COMPONENT_REPLACEMENT" ? "replaced" : pick(["pass", "fail", "repaired", "observed"]),
-        });
-        if (type === "COMPONENT_REPLACEMENT") input.partOrigin = pick(["new-oem", "new-compatible", "refurbished"]);
-        if ((type === "INSPECTION" || type === "DIAGNOSTIC") && rng() < 0.5) input.componentAssertions = [{ component: pick(REPLACEABLE), state: rng() < 0.7 ? "original" : "replaced" }];
-      }
-      const item: Item = { idx: items.length, device: d, type, actor, input };
-      if (type !== "CUSTODY_TRANSFER" && rng() < 0.4) {
-        const size = 1500 + Math.floor(rng() * 4500);
-        item.evidence = Buffer.from(`SYNTHETIC BENCHMARK EVIDENCE device=${d} item=${item.idx}\n` + hex(size));
-      }
-      items.push(item);
-      claims.push(item.idx);
-    }
-  }
-  return items;
+interface Work {
+  i: number;
+  researcher: string;
+  program: number;
+  fields: ReportFields;
+  verdict: "valid" | "invalid";
+}
+const workload: Work[] = Array.from({ length: REPORTS }, (_, i) => ({ i, researcher: pick(RESEARCHERS), program: 1 + Math.floor(rng() * 3), fields: syntheticReport(i + 1), verdict: rng() < 0.7 ? "valid" : "invalid" }));
+// cross-program pairs for association/dispute load
+const pairs: [number, number][] = [];
+for (let k = 0; k + 1 < workload.length && pairs.length < Math.max(1, Math.floor(REPORTS / 5)); k += 2) {
+  const a = workload[k], b = workload.slice(k + 1).find((w) => w.program !== a.program);
+  if (b && !pairs.some(([x, y]) => [x, y].includes(a.i) || [x, y].includes(b.i))) pairs.push([a.i, b.i]);
 }
 
 // ------------------------------------------------------------------ stats
@@ -127,6 +100,7 @@ interface Stats {
 }
 function stats(xs: number[]): Stats {
   const s = [...xs].sort((a, b) => a - b);
+  if (!s.length) return { n: 0, median: 0, p95: null, mean: 0, min: 0, max: 0 };
   const q = (p: number) => {
     const i = (s.length - 1) * p;
     const lo = Math.floor(i);
@@ -135,671 +109,602 @@ function stats(xs: number[]): Stats {
   const r = (v: number) => Math.round(v * 1000) / 1000;
   return { n: s.length, median: r(q(0.5)), p95: s.length >= 20 ? r(q(0.95)) : null, mean: r(s.reduce((a, b) => a + b, 0) / s.length), min: r(s[0]), max: r(s[s.length - 1]) };
 }
+const time = async <T,>(bucket: number[], fn: () => Promise<T> | T): Promise<T> => {
+  const t0 = performance.now();
+  const r = await fn();
+  bucket.push(performance.now() - t0);
+  return r;
+};
 
-// ------------------------------------------------------------------ main
-const workload = genWorkload();
-const totalRecords = workload.length;
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "patchledger-bench-"));
-log(`seed=${SEED} devices=${DEVICES} events/device=${EVENTS} records/store=${totalRecords} trials=${TRIALS}`);
-log(`working directory ${tmp}`);
-
+// ------------------------------------------------------------------ setup
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "vulnseal-bench-"));
+log(`seed=${SEED} reports=${REPORTS} pairs=${pairs.length} trials=${TRIALS}`);
 const chain = await startChain();
 let exitCode = 0;
 try {
-  const { address, gasUsed: deployGas } = await deployPatchLedger(chain.url);
-  const ledger = new Ledger(chain.url, address);
-  const bcStore = new Store(path.join(tmp, "blockchain-offchain.sqlite"));
-  const svc = new PatchLedgerService(bcStore, ledger, new EvidenceVault(path.join(tmp, "blockchain-evidence")));
+  const keyring = Keyring.generate();
+  const vault = Vault.open(path.join(tmp, "keys"));
+  const store = new Store(path.join(tmp, "blockchain-offchain.sqlite"));
+  const init = await initConsortium({ rpcUrl: chain.url, keyring, store, appealWindowSeconds: 3600 });
+  const ledger: Ledger = init.ledger;
+  const gas: Record<string, number[]> = {};
+  const calldata: number[] = [];
+  const realSend = ledger.send.bind(ledger);
+  (ledger as any).send = async (who: string, method: string, args: unknown[]) => {
+    const r = await realSend(who, method, args);
+    (gas[method] ??= []).push(r.gasUsed);
+    const tx = await ledger.provider.getTransaction(r.hash);
+    if (tx) calldata.push((tx.data.length - 2) / 2);
+    return r;
+  };
+  const svc = new VulnSealService({ store, vault, ledger, keyring, evidenceDir: path.join(tmp, "evidence") });
   const lab = new TamperLab(svc);
-  const editable = new EditableStore(tmp);
-  const hardened = new HardenedStore(tmp, false);
-  const anchored = new HardenedStore(tmp, true);
+  const v = (id: string): Viewer => svc.viewer(id)!;
+  const editable = new EditableDesign(tmp);
+  const hardened = new HardenedDesign(tmp, false);
+  const anchored = new HardenedDesign(tmp, true);
+  const central: CentralDesign[] = [editable, hardened, anchored];
+  const DESIGNS = ["editable", "hardened", "hardened-anchored", "blockchain"] as const;
+  type DesignId = (typeof DESIGNS)[number];
 
-  const payloadFor = (item: Item, dev: string, ev?: { id: string; sha: string }) => {
-    const { type: _t, refSeq: _r, ...rest } = item.input;
-    const p: Record<string, unknown> = { schema: "patchledger.event.v1", type: item.type, device: dev, ...rest, evidence: ev ? [{ id: ev.id, kind: "other", sha256: ev.sha }] : [], nonce: hex(32) };
-    if (item.type === "CORRECTION") p.corrected = { description: item.input.description, result: item.input.result };
-    return p;
+  // researcher-side vault for the centralised designs (content + nonce), kept by the client
+  const centralPkgs = new Map<string, any>();
+  const centralCommit = (d: CentralDesign, who: string, program: number, fields: ReportFields) => {
+    const nonce = hexlify(new Uint8Array(32).map(() => Math.floor(rng() * 256)));
+    const address = keyring.address(who);
+    const id = Number((d.db.prepare(d instanceof EditableDesign ? "SELECT COALESCE(MAX(id), 0) + 1 n FROM submissions" : "SELECT COALESCE(MAX(id), 0) + 1 n FROM sealed").get() as any).n);
+    const commitment = computeCommitment({ chainId: OFFCHAIN_CHAIN_ID, contract: OPERATOR_CONTRACT, researcher: address, programId: program, policyVersion: 1 }, fieldsDigest(fields), nonce);
+    const sealed = vault.sealJson("report", `${d.id}:${id}`, { fields, nonce });
+    const receipt = d.commit(who, address, program, commitment, sealed);
+    const pkg = { format: REVEAL_FORMAT, commitmentId: receipt.id, chainId: OFFCHAIN_CHAIN_ID, contract: OPERATOR_CONTRACT, researcher: address, programId: program, policyVersion: 1, report: { schema: REPORT_SCHEMA, ...fields }, nonce };
+    centralPkgs.set(`${d.id}:${receipt.id}`, pkg);
+    return { receipt, pkg };
   };
+  const edited = (pkg: any, impact = "Exaggerated after the fact.") => ({ ...pkg, report: { ...pkg.report, impact } });
 
-  // ---------------------------------------------------------------- inserts
-  const seqMap: Record<string, Map<number, number>> = { editable: new Map(), hardened: new Map(), "hardened-anchored": new Map(), blockchain: new Map() };
-  const evMap: Record<string, Map<number, string>> = { editable: new Map(), hardened: new Map(), "hardened-anchored": new Map(), blockchain: new Map() };
-  const insertMs: Record<string, number[]> = { editable: [], hardened: [], "hardened-anchored": [], blockchain: [] };
-  const pid: string[] = [];
-  const devName = (d: number) => `BENCH-${String(d).padStart(4, "0")}`;
-  const gasByType: Record<string, number[]> = {};
-  const txHashes: string[] = [];
+  // ------------------------------------------------------------------ measured workload
+  const perf: Record<DesignId, { commit: number[]; receipt: number[]; transition: number[]; reveal: number[] }> = Object.fromEntries(
+    DESIGNS.map((d) => [d, { commit: [], receipt: [], transition: [], reveal: [] }]),
+  ) as any;
+  const idOf: Record<DesignId, number[]> = { editable: [], hardened: [], "hardened-anchored": [], blockchain: [] };
+  const receipts: Record<DesignId, any[]> = { editable: [], hardened: [], "hardened-anchored": [], blockchain: [] };
 
-  log("inserting into blockchain store (real transactions)…");
-  for (const item of workload) {
-    if (item.type === "REGISTRATION") {
-      const t0 = performance.now();
-      const r = await svc.registerDevice("registrar", { brand: item.input.brand!, model: item.input.model!, year: item.input.year, synthetic: true });
-      insertMs.blockchain.push(performance.now() - t0);
-      pid[item.device] = r.publicId;
-      seqMap.blockchain.set(item.idx, 0);
-      (gasByType.REGISTRATION ??= []).push(r.tx.gasUsed);
-      txHashes.push(r.tx.txHash);
-      continue;
-    }
-    const p = pid[item.device];
-    const evIds: string[] = [];
-    if (item.evidence) {
-      const e = svc.uploadEvidence(item.actor, p, { buffer: item.evidence, originalname: `bench-${item.idx}.txt`, mimetype: "text/plain" }, { kind: "other" });
-      evIds.push(e.evidence.id);
-      evMap.blockchain.set(item.idx, e.evidence.id);
-    }
-    const input = { ...item.input, refSeq: item.refIdx !== undefined ? seqMap.blockchain.get(item.refIdx) : undefined, evidenceIds: evIds };
-    const t0 = performance.now();
-    const r = await svc.appendEvent(item.actor, p, input);
-    insertMs.blockchain.push(performance.now() - t0);
-    seqMap.blockchain.set(item.idx, r.seq);
-    (gasByType[item.type] ??= []).push(r.tx.gasUsed);
-    txHashes.push(r.tx.txHash);
+  log("workload on the blockchain design (real transactions)…");
+  for (const w of workload) {
+    const r = await time(perf.blockchain.commit, () => svc.commitReport(v(w.researcher), { ...w.fields, programId: w.program }, undefined, { withReceipt: false }));
+    idOf.blockchain.push(r.cid);
+    receipts.blockchain.push(await svc.receipt(v(w.researcher), r.cid));
+    const t = TRIAGE[w.program];
+    await time(perf.blockchain.transition, () => svc.acknowledge(v(t), r.cid));
+    await time(perf.blockchain.transition, () => svc.requestReveal(v(t), r.cid));
+    const sub = await svc.submitReveal(v(w.researcher), r.cid, { mode: "vault" });
+    await time(perf.blockchain.reveal, () => svc.verifyReveal(v(t), sub.revealId));
+    await time(perf.blockchain.transition, () => svc.triage(v(t), r.cid, "pending-triage", ""));
+    await time(perf.blockchain.transition, () => svc.triage(v(t), r.cid, w.verdict, ""));
   }
-
-  for (const [id, st] of [["editable", editable], ["hardened", hardened], ["hardened-anchored", anchored]] as const) {
-    log(`inserting into ${id} store…`);
-    for (const item of workload) {
-      const dev = devName(item.device);
-      let ev: { id: string; sha: string } | undefined;
-      if (item.evidence) {
-        const evId = `ev-${item.idx}`;
-        ev = { id: evId, sha: st.storeEvidence(evId, item.evidence) };
-        evMap[id].set(item.idx, evId);
-      }
-      const payload = payloadFor(item, dev, ev);
-      const ref = item.refIdx !== undefined ? seqMap[id].get(item.refIdx) : undefined;
-      const t0 = performance.now();
-      const seq = st instanceof EditableStore ? st.append(item.actor, dev, item.type, payload, ref, ev) : st.append(item.actor, dev, item.type, payload, ref);
-      insertMs[id].push(performance.now() - t0);
-      seqMap[id].set(item.idx, seq);
+  for (const d of central) {
+    log(`workload on the ${d.id} design…`);
+    const p = perf[d.id as DesignId];
+    for (const w of workload) {
+      const { receipt, pkg } = await time(p.commit, () => centralCommit(d, w.researcher, w.program, w.fields));
+      idOf[d.id as DesignId].push(receipt.id);
+      receipts[d.id as DesignId].push(receipt);
+      const t = TRIAGE[w.program];
+      await time(p.transition, () => d.move(t, receipt.id, ST.ACKNOWLEDGED));
+      await time(p.transition, () => d.move(t, receipt.id, ST.REVEAL_REQUESTED));
+      await time(p.reveal, () => d.reveal(t, receipt.id, pkg));
+      await time(p.transition, () => d.move(t, receipt.id, ST.PENDING_TRIAGE));
+      await time(p.transition, () => d.move(t, receipt.id, w.verdict === "valid" ? ST.VALID : ST.INVALID));
     }
   }
-
-  // ---------------------------------------------------------------- verification latency
-  const verifyMs: Record<string, number[]> = { editable: [], hardened: [], "hardened-anchored": [], blockchain: [] };
-  const verifyFindings: Record<string, number> = { editable: 0, hardened: 0, "hardened-anchored": 0, blockchain: 0 };
-  for (let d = 0; d < DEVICES; d++) {
-    for (const [id, st] of [["editable", editable], ["hardened", hardened], ["hardened-anchored", anchored]] as const) {
-      const t0 = performance.now();
-      const f = st.verify(devName(d));
-      verifyMs[id].push(performance.now() - t0);
-      verifyFindings[id] += f.length;
+  // associations and disputes over the same pairs (counted as events, timed as transitions)
+  for (const [ia, ib] of pairs) {
+    const A = workload[ia], B = workload[ib];
+    const aid = (await time(perf.blockchain.transition, () => svc.proposeAssociation(v(TRIAGE[A.program]), idOf.blockchain[ia], idOf.blockchain[ib], RELATION.SAME_ISSUE, "benchmark association"))).aid;
+    await time(perf.blockchain.transition, () => svc.reviewAssociation(v(TRIAGE[B.program]), aid, true, "benchmark review"));
+    const did = (await time(perf.blockchain.transition, () => svc.openDispute(v(A.researcher), DISPUTE_KIND.PRIORITY, aid, "benchmark dispute"))).did;
+    for (const arb of ["arb-holm", "arb-okafor"]) await time(perf.blockchain.transition, () => svc.vote(v(arb), did, DECISION.PRIORITY_FIRST, 100, "benchmark vote"));
+    for (const d of central) {
+      const p = perf[d.id as DesignId].transition;
+      const ids = idOf[d.id as DesignId];
+      const caid = await time(p, () => d.propose(TRIAGE[A.program], ids[ia], ids[ib], RELATION.SAME_ISSUE));
+      await time(p, () => d.review(TRIAGE[B.program], caid, true));
+      const cdid = await time(p, () => d.openDispute(A.researcher, DISPUTE_KIND.PRIORITY, caid));
+      for (const arb of ["arb-holm", "arb-okafor"]) await time(p, () => d.vote(arb, cdid, DECISION.PRIORITY_FIRST, 100));
     }
-    const t0 = performance.now();
-    const r = await svc.checkIntegrity(pid[d]);
-    verifyMs.blockchain.push(performance.now() - t0);
-    verifyFindings.blockchain += r.findings.filter((f) => f.severity === "error").length;
   }
-  log(`baseline verification errors (should be 0): ${JSON.stringify(verifyFindings)}`);
+  // receipt verification
+  log("receipt verification…");
+  for (const r of receipts.blockchain) await time(perf.blockchain.receipt, () => verifyChainReceipt(r, ledger.provider));
+  for (const d of central) for (const r of receipts[d.id as DesignId]) await time(perf[d.id as DesignId].receipt, () => d.verifyReceipt(r));
 
-  // ---------------------------------------------------------------- storage
-  let calldata = 0;
-  for (const h of txHashes) {
-    const tx = await ledger.provider.getTransaction(h);
-    calldata += tx ? (tx.data.length - 2) / 2 : 0;
+  // ------------------------------------------------------------------ storage
+  store.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  const bcBytes = (store.db.prepare("PRAGMA page_count").get() as any).page_count * (store.db.prepare("PRAGMA page_size").get() as any).page_size;
+  const bcEvents = Number(await ledger.read("logCount"));
+  const centralEvents = { editable: editable.events, hardened: hardened.events, "hardened-anchored": anchored.events };
+  const allGas = Object.values(gas).flat();
+  const commitGas = gas.anchorCommitment ?? [];
+  const meta: Record<DesignId, { name: string; description: string }> = {
+    editable: { name: "Editable SQLite", description: "Conventional record: rows updated in place, editable status log, unsigned receipts checked against the database" },
+    hardened: { name: "Hardened log", description: "Append-only, SHA-256 hash-chained entries signed by the operator (Ed25519); triggers block UPDATE/DELETE; signed receipts" },
+    "hardened-anchored": { name: "Hardened + checkpoints", description: "As hardened, plus the head hash handed to an independent party after every write" },
+    blockchain: { name: "VulnSeal (local chain)", description: "Contract enforces roles, transitions and arbitration rules; commitments and a hash-chained log on-chain; content sealed off-chain" },
+  };
+  // contract storage per submission: Commitment struct (5 slots) + usedCommitment (1) + log entry (1)
+  const ON_CHAIN_BYTES_PER_SUBMISSION = 7 * 32;
+  const designs = DESIGNS.map((id) => {
+    const p = perf[id];
+    const totalCommitSec = p.commit.reduce((a, b) => a + b, 0) / 1000;
+    const isChain = id === "blockchain";
+    const bytes = isChain ? bcBytes : (central.find((d) => d.id === id) as CentralDesign).size();
+    const events = isChain ? bcEvents : centralEvents[id as Exclude<DesignId, "blockchain">];
+    return {
+      id,
+      ...meta[id],
+      metrics: {
+        commit: stats(p.commit),
+        receiptVerify: stats(p.receipt),
+        transition: stats(p.transition),
+        revealCheck: stats(p.reveal),
+        throughputCommitsPerSec: p.commit.length / totalCommitSec,
+        storage: {
+          bytesPerSubmission: bytes / REPORTS,
+          bytesPerEvent: bytes / events,
+          events,
+          onChainBytesPerSubmission: isChain ? ON_CHAIN_BYTES_PER_SUBMISSION : null,
+          calldataBytesPerTx: isChain ? stats(calldata).mean : null,
+          method: isChain
+            ? "off-chain: SQLite page_count x page_size of the VulnSeal store (sealed reports, reveals, mirror, rationales); on-chain: storage slots per submission from the contract layout (5-slot struct + replay-protection slot + log-entry slot)"
+            : "SQLite page_count x page_size after a WAL checkpoint (sealed content included)",
+        },
+        gas: isChain
+          ? {
+              meanPerSubmission: commitGas.reduce((a, b) => a + b, 0) / Math.max(1, commitGas.length),
+              meanPerTx: allGas.reduce((a, b) => a + b, 0) / Math.max(1, allGas.length),
+              perOperation: Object.fromEntries(Object.entries(gas).map(([m, g]) => [m, stats(g).median])),
+              deployment: init.gasUsed,
+            }
+          : null,
+      },
+    };
+  });
+
+  // ------------------------------------------------------------------ scenarios
+  type Outcome = "prevented" | "detected" | "undetected" | "passed" | "failed";
+  interface Res {
+    trials: number;
+    prevented: number;
+    detected: number;
+    undetected: number;
+    passed: number;
+    note: string;
   }
-  const corrections = workload.filter((w) => w.type === "CORRECTION").length;
-  // contract storage written: 4 slots per Record, +1 array-length slot per device, +1 supersededBy slot per correction,
-  // +3 global counters (deviceCount/totalRecords) amortised are ignored as constant.
-  const onChainSlots = totalRecords * 4 + DEVICES + corrections;
-  const allSeries = Object.values(gasByType).flat();
-  const storeMeta: Record<string, { name: string; description: string }> = {
-    editable: { name: "Editable SQLite", description: "CRUD store; app-level roles; corrections and dispute status updated in place" },
-    hardened: { name: "Hardened SQLite", description: "Append-only triggers; SHA-256 hash chain; app-level roles" },
-    "hardened-anchored": { name: "Hardened + checkpoints", description: "As hardened, plus head hashes handed to an independent party after every write" },
-    blockchain: { name: "PatchLedger (local chain)", description: "Solidity contract enforces roles and append-only links; payloads off-chain, digests on-chain" },
+  const scenarios: { id: string; title: string; attacker: string; kind: "attack" | "functional"; results: Record<string, Res> }[] = [];
+  const rejected = async (fn: () => unknown) => {
+    try {
+      await fn();
+      return false;
+    } catch (e) {
+      return e instanceof Rejected || (e as any)?.contractError || (e as any)?.status === 403 || (e as any)?.status === 409;
+    }
   };
-  const sizes: Record<string, number> = { editable: editable.sizeBytes(), hardened: hardened.sizeBytes(), "hardened-anchored": anchored.sizeBytes() };
-  bcStore.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-  sizes.blockchain = (bcStore.db.prepare("PRAGMA page_count").get() as any).page_count * (bcStore.db.prepare("PRAGMA page_size").get() as any).page_size;
-
-  const stores = (["editable", "hardened", "hardened-anchored", "blockchain"] as const).map((id) => ({
-    id,
-    ...storeMeta[id],
-    insert: stats(insertMs[id]),
-    verify: stats(verifyMs[id]),
-    throughputPerSec: insertMs[id].length / (insertMs[id].reduce((a, b) => a + b, 0) / 1000),
-    storage: {
-      offChainBytesPerRecord: sizes[id] / totalRecords,
-      onChainBytesPerRecord: id === "blockchain" ? (onChainSlots * 32) / totalRecords : null,
-      calldataBytesPerRecord: id === "blockchain" ? calldata / totalRecords : null,
-      method:
-        id === "blockchain"
-          ? "off-chain: SQLite page_count×page_size ÷ records; on-chain: contract storage slots written (4×32 B per record + per-device and per-correction mapping slots), from the struct layout"
-          : "SQLite page_count×page_size ÷ records (after WAL checkpoint); evidence files excluded for all stores",
-    },
-    gas:
-      id === "blockchain"
-        ? {
-            meanPerRecord: allSeries.reduce((a, b) => a + b, 0) / allSeries.length,
-            perType: Object.fromEntries(Object.entries(gasByType).map(([t, g]) => [t, { n: g.length, median: stats(g).median }])),
-            deployment: deployGas,
-          }
-        : null,
-  }));
-
-  // ---------------------------------------------------------------- scenarios
-  type Outcome = "prevented" | "detected" | "undetected";
-  type Res = { trials: number; prevented: number; detected: number; undetected: number; protectedRate: number; note: string };
-  const STORE_IDS = ["editable", "hardened", "hardened-anchored", "blockchain"] as const;
-  const blank = (): Res => ({ trials: 0, prevented: 0, detected: 0, undetected: 0, protectedRate: 0, note: "" });
-  const errs = (f: Finding[]) => f.filter((x) => x.severity === "error").length;
-  const bcErrs = async (d: number) => (await svc.checkIntegrity(pid[d])).findings.filter((f) => f.severity === "error").length;
-  const claimItems = workload.filter((w) => w.type !== "REGISTRATION" && w.type !== "CORRECTION");
-  const evItems = workload.filter((w) => w.evidence);
-  const shuffled = <T,>(xs: T[]) => xs.map((x) => [rng(), x] as const).sort((a, b) => a[0] - b[0]).map((x) => x[1]);
-  const targets = (pool: Item[]) => {
-    const s = shuffled(pool);
-    return Array.from({ length: TRIALS }, (_, i) => s[i % s.length]);
-  };
-  const mutate = (p: any) => {
-    p.description = `${p.description ?? ""} [altered]`;
-    if (Array.isArray(p.componentAssertions)) p.componentAssertions = p.componentAssertions.map((a: any) => ({ ...a, state: a.state === "original" ? "replaced" : "original" }));
-  };
-  const scenarios: { id: string; title: string; attacker: string; kind: "attack" | "detection" | "preservation"; results: Record<string, Res> }[] = [];
-
   async function scenario(
     id: string,
     title: string,
     attacker: string,
-    kind: "attack" | "detection" | "preservation",
-    pool: Item[],
-    run: Record<(typeof STORE_IDS)[number], (t: Item, trial: number) => Promise<Outcome> | Outcome>,
-    notes: Partial<Record<(typeof STORE_IDS)[number], string>> = {},
+    kind: "attack" | "functional",
+    run: Record<DesignId, (trial: number) => Promise<Outcome> | Outcome>,
+    notes: Partial<Record<DesignId, string>> = {},
   ) {
     log(`scenario ${id}: ${title}`);
     const results: Record<string, Res> = {};
-    const ts = targets(pool);
-    for (const sid of STORE_IDS) {
-      const r = blank();
-      for (let i = 0; i < ts.length; i++) {
-        const o = await run[sid](ts[i], i);
-        r[o]++;
+    for (const d of DESIGNS) {
+      const r: Res = { trials: 0, prevented: 0, detected: 0, undetected: 0, passed: 0, note: notes[d] ?? "" };
+      for (let t = 0; t < TRIALS; t++) {
+        const o = await run[d](t);
         r.trials++;
+        if (o === "passed") r.passed++;
+        else if (o === "failed") r.undetected++;
+        else r[o]++;
       }
-      r.protectedRate = (r.prevented + r.detected) / r.trials;
-      r.note = notes[sid] ?? "";
-      results[sid] = r;
+      results[d] = r;
     }
     scenarios.push({ id, title, attacker, kind, results });
   }
 
-  // S1 — edit a stored claim (and its own hash where one exists)
-  await scenario(
-    "S1",
-    "Unauthorized modification of an existing record",
-    "Database administrator edits a claim directly (bypassing the app) and recomputes that record's own digest/hash",
-    "attack",
-    claimItems,
-    {
-      editable: (t) => {
-        const dev = devName(t.device), seq = seqMap.editable.get(t.idx)!;
-        const row = editable.get(dev, seq);
-        const before = errs(editable.verify(dev));
-        const p = JSON.parse(row.payload);
-        mutate(p);
-        editable.db.prepare("UPDATE records SET payload=? WHERE device=? AND seq=?").run(JSON.stringify(p), dev, seq);
-        const after = errs(editable.verify(dev));
-        editable.db.prepare("UPDATE records SET payload=? WHERE device=? AND seq=?").run(row.payload, dev, seq);
-        return after > before ? "detected" : "undetected";
-      },
-      hardened: (t) => {
-        const dev = devName(t.device), snap = hardened.snapshot(dev);
-        hardened.editOwnHash(dev, seqMap.hardened.get(t.idx)!, mutate);
-        const o = errs(hardened.verify(dev)) > 0 ? "detected" : "undetected";
-        hardened.restore(dev, snap);
-        return o;
-      },
-      "hardened-anchored": (t) => {
-        const dev = devName(t.device), snap = anchored.snapshot(dev);
-        anchored.editOwnHash(dev, seqMap["hardened-anchored"].get(t.idx)!, mutate);
-        const o = errs(anchored.verify(dev)) > 0 ? "detected" : "undetected";
-        anchored.restore(dev, snap);
-        return o;
-      },
-      blockchain: async (t) => {
-        const before = await bcErrs(t.device);
-        lab.editRecord(pid[t.device], seqMap.blockchain.get(t.idx)!);
-        const after = await bcErrs(t.device);
-        lab.restoreAll();
-        return after > before ? "detected" : "undetected";
-      },
-    },
-    { hardened: "Edits of the newest record leave no broken link and pass local verification", editable: "No integrity metadata covers record content" },
-  );
-
-  // S2 — consistent rewrite of the whole chain after the target
-  await scenario(
-    "S2",
-    "Consistent history rewrite",
-    "Database administrator edits a claim and recomputes every subsequent hash so the local chain is self-consistent",
-    "attack",
-    claimItems,
-    {
-      editable: (t) => {
-        const dev = devName(t.device), seq = seqMap.editable.get(t.idx)!;
-        const row = editable.get(dev, seq);
-        const p = JSON.parse(row.payload);
-        mutate(p);
-        editable.db.prepare("UPDATE records SET payload=? WHERE device=? AND seq=?").run(JSON.stringify(p), dev, seq);
-        const o = errs(editable.verify(dev)) > 0 ? "detected" : "undetected";
-        editable.db.prepare("UPDATE records SET payload=? WHERE device=? AND seq=?").run(row.payload, dev, seq);
-        return o;
-      },
-      hardened: (t) => {
-        const dev = devName(t.device), snap = hardened.snapshot(dev);
-        hardened.consistentRewrite(dev, seqMap.hardened.get(t.idx)!, mutate);
-        const o = errs(hardened.verify(dev)) > 0 ? "detected" : "undetected";
-        hardened.restore(dev, snap);
-        return o;
-      },
-      "hardened-anchored": (t) => {
-        const dev = devName(t.device), snap = anchored.snapshot(dev);
-        anchored.consistentRewrite(dev, seqMap["hardened-anchored"].get(t.idx)!, mutate);
-        const o = errs(anchored.verify(dev)) > 0 ? "detected" : "undetected";
-        anchored.restore(dev, snap);
-        return o;
-      },
-      blockchain: async (t) => {
-        const seq = seqMap.blockchain.get(t.idx)!;
-        lab.editRecord(pid[t.device], seq);
-        // the insider also tries to rewrite the on-chain history by building on the target's predecessor
-        const deviceKey = svc.store.getDevice(pid[t.device])!.device_key;
-        const recs = await ledger.getRecords(deviceKey);
-        let onChainRewritten = false;
-        try {
-          await ledger.appendRecord(t.actor, { deviceKey, recordType: typeCode("REPAIR"), expectedPrevHash: recs[seq].prevHash, payloadDigest: recs[seq].payloadDigest, refSeq: NO_REF });
-          onChainRewritten = true;
-        } catch {
-          /* StalePrevHash: expected */
-        }
-        const after = await bcErrs(t.device);
-        lab.restoreAll();
-        return onChainRewritten ? "undetected" : after > 0 ? "detected" : "undetected";
-      },
-    },
-    { "hardened-anchored": "Detected because the externally held head hash no longer matches", blockchain: "Off-chain rewrite detected; the on-chain rewrite attempt reverted (StalePrevHash)" },
-  );
-
-  // S3 — delete an event
-  await scenario(
-    "S3",
-    "Deletion of an event record",
-    "Database administrator deletes a record row",
-    "attack",
-    claimItems,
-    {
-      editable: (t) => {
-        const dev = devName(t.device), seq = seqMap.editable.get(t.idx)!;
-        const row = editable.get(dev, seq);
-        editable.db.prepare("DELETE FROM records WHERE device=? AND seq=?").run(dev, seq);
-        const o = errs(editable.verify(dev)) > 0 ? "detected" : "undetected";
-        editable.db.prepare("INSERT INTO records VALUES (?,?,?,?,?,?,?,?,?)").run(row.device, row.seq, row.type, row.actor, row.payload, row.evidence_id, row.evidence_sha, row.ref_seq, row.updated_at);
-        return o;
-      },
-      hardened: (t) => {
-        const dev = devName(t.device), snap = hardened.snapshot(dev);
-        hardened.deleteRecord(dev, seqMap.hardened.get(t.idx)!);
-        const o = errs(hardened.verify(dev)) > 0 ? "detected" : "undetected";
-        hardened.restore(dev, snap);
-        return o;
-      },
-      "hardened-anchored": (t) => {
-        const dev = devName(t.device), snap = anchored.snapshot(dev);
-        anchored.deleteRecord(dev, seqMap["hardened-anchored"].get(t.idx)!);
-        const o = errs(anchored.verify(dev)) > 0 ? "detected" : "undetected";
-        anchored.restore(dev, snap);
-        return o;
-      },
-      blockchain: async (t) => {
-        lab.deleteRecord(pid[t.device], seqMap.blockchain.get(t.idx)!);
-        const o = (await bcErrs(t.device)) > 0 ? "detected" : "undetected";
-        lab.restoreAll();
-        return o;
-      },
-    },
-    { editable: "Only deletions that leave a sequence gap are noticed; deleting the newest record is not", hardened: "Deleting the newest record leaves the remaining chain valid" },
-  );
-
-  // S4 — evidence file altered (file-store access only)
-  const alterFile = (p: string) => {
-    const orig = fs.readFileSync(p);
-    fs.writeFileSync(p, Buffer.concat([orig, Buffer.from("\naltered")]));
-    return () => fs.writeFileSync(p, orig);
+  // helpers producing a fresh revealed (or reveal-requested) report in each design
+  const freshChain = async (who: string, program: number, fields = syntheticReport(1000), reveal = true) => {
+    const r = await svc.commitReport(v(who), { ...fields, programId: program }, undefined, { withReceipt: false });
+    await svc.acknowledge(v(TRIAGE[program]), r.cid);
+    await svc.requestReveal(v(TRIAGE[program]), r.cid);
+    if (reveal) {
+      const s = await svc.submitReveal(v(who), r.cid, { mode: "vault" });
+      await svc.verifyReveal(v(TRIAGE[program]), s.revealId);
+    }
+    return r.cid;
   };
-  await scenario(
-    "S4",
-    "Alteration of a supporting evidence file",
-    "Attacker with write access to the evidence file store replaces a file's bytes",
-    "attack",
-    evItems,
-    {
-      editable: (t) => {
-        const dev = devName(t.device), undo = alterFile(path.join(editable.evDir, evMap.editable.get(t.idx)!));
-        const o = errs(editable.verify(dev)) > 0 ? "detected" : "undetected";
-        undo();
-        return o;
-      },
-      hardened: (t) => {
-        const undo = alterFile(path.join(hardened.evDir, evMap.hardened.get(t.idx)!));
-        const o = errs(hardened.verify(devName(t.device))) > 0 ? "detected" : "undetected";
-        undo();
-        return o;
-      },
-      "hardened-anchored": (t) => {
-        const undo = alterFile(path.join(anchored.evDir, evMap["hardened-anchored"].get(t.idx)!));
-        const o = errs(anchored.verify(devName(t.device))) > 0 ? "detected" : "undetected";
-        undo();
-        return o;
-      },
-      blockchain: async (t) => {
-        lab.alterEvidence(evMap.blockchain.get(t.idx)!, "file");
-        const o = (await bcErrs(t.device)) > 0 ? "detected" : "undetected";
-        lab.restoreAll();
-        return o;
-      },
-    },
-    { editable: "Detected because this baseline also stores SHA-256 digests" },
-  );
-
-  // S5 — evidence file and its stored digest altered together
-  await scenario(
-    "S5",
-    "Evidence file and its stored digest replaced together",
-    "Attacker with database and file-store access replaces a file and updates the digest stored with it (recomputing that record's own hash where one exists)",
-    "attack",
-    evItems,
-    {
-      editable: (t) => {
-        const dev = devName(t.device), seq = seqMap.editable.get(t.idx)!, p = path.join(editable.evDir, evMap.editable.get(t.idx)!);
-        const row = editable.get(dev, seq);
-        const undo = alterFile(p);
-        editable.db.prepare("UPDATE records SET evidence_sha=? WHERE device=? AND seq=?").run(sha(fs.readFileSync(p)), dev, seq);
-        const o = errs(editable.verify(dev)) > 0 ? "detected" : "undetected";
-        undo();
-        editable.db.prepare("UPDATE records SET evidence_sha=? WHERE device=? AND seq=?").run(row.evidence_sha, dev, seq);
-        return o;
-      },
-      hardened: (t) => hardenedEvidenceSwap(hardened, t, seqMap.hardened, evMap.hardened),
-      "hardened-anchored": (t) => hardenedEvidenceSwap(anchored, t, seqMap["hardened-anchored"], evMap["hardened-anchored"]),
-      blockchain: async (t) => {
-        lab.alterEvidence(evMap.blockchain.get(t.idx)!, "file-and-db");
-        const o = (await bcErrs(t.device)) > 0 ? "detected" : "undetected";
-        lab.restoreAll();
-        return o;
-      },
-    },
-  );
-  function hardenedEvidenceSwap(st: HardenedStore, t: Item, sm: Map<number, number>, em: Map<number, string>): Outcome {
-    const dev = devName(t.device), snap = st.snapshot(dev), p = path.join(st.evDir, em.get(t.idx)!);
-    const undo = alterFile(p);
-    const newSha = sha(fs.readFileSync(p));
-    st.editOwnHash(dev, sm.get(t.idx)!, (pl) => (pl.evidence = pl.evidence.map((e: any) => ({ ...e, sha256: newSha }))));
-    const o = errs(st.verify(dev)) > 0 ? "detected" : "undetected";
-    undo();
-    st.restore(dev, snap);
-    return o;
-  }
-
-  // S6 — unauthorized role through the application / contract
-  const unauthorized = (t: Item, i: number) => {
-    const kinds = [
-      { actor: "buyer", type: "REPAIR" as RecordType },
-      { actor: "auditor", type: "COMPONENT_REPLACEMENT" as RecordType },
-      { actor: "outsider", type: "DIAGNOSTIC" as RecordType },
-      { actor: t.actor === "repairer-b" ? "repairer-a" : "repairer-b", type: "CORRECTION" as RecordType },
-    ];
-    return kinds[i % kinds.length];
+  const freshCentral = (d: CentralDesign, who: string, program: number, fields = syntheticReport(1000), reveal = true) => {
+    const { receipt, pkg } = centralCommit(d, who, program, fields);
+    d.move(TRIAGE[program], receipt.id, ST.ACKNOWLEDGED);
+    d.move(TRIAGE[program], receipt.id, ST.REVEAL_REQUESTED);
+    if (reveal) d.reveal(TRIAGE[program], receipt.id, pkg);
+    return { id: receipt.id, pkg };
   };
-  await scenario(
-    "S6",
-    "Unauthorized role submits a record",
-    "A party without the required role (buyer, auditor, unregistered account, or a different repairer correcting someone else's claim) uses the normal write path",
-    "attack",
-    claimItems,
-    {
-      editable: (t, i) => appAttempt(() => {
-        const k = unauthorized(t, i);
-        editable.append(k.actor, devName(t.device), k.type, { description: "unauthorized", corrected: { description: "x" } }, k.type === "CORRECTION" ? seqMap.editable.get(t.idx) : undefined);
-      }),
-      hardened: (t, i) => appAttempt(() => {
-        const k = unauthorized(t, i);
-        hardened.append(k.actor, devName(t.device), k.type, { description: "unauthorized" }, k.type === "CORRECTION" ? seqMap.hardened.get(t.idx) : undefined);
-      }),
-      "hardened-anchored": (t, i) => appAttempt(() => {
-        const k = unauthorized(t, i);
-        anchored.append(k.actor, devName(t.device), k.type, { description: "unauthorized" }, k.type === "CORRECTION" ? seqMap["hardened-anchored"].get(t.idx) : undefined);
-      }),
-      blockchain: async (t, i) => {
-        const k = unauthorized(t, i);
-        try {
-          await svc.appendEvent(k.actor, pid[t.device], {
-            type: k.type,
-            description: "unauthorized attempt",
-            reason: "unauthorized correction",
-            category: "general",
-            result: "pass",
-            component: "battery",
-            partOrigin: "unknown",
-            refSeq: k.type === "CORRECTION" ? seqMap.blockchain.get(t.idx) : undefined,
-          });
-          return "undetected";
-        } catch (e: any) {
-          return e?.status === 403 ? "prevented" : "undetected";
-        }
-      },
-    },
-    { editable: "Rejected by application code; relies on every write going through the application", blockchain: "Reverted by the contract (NotAuthorized / NotOriginalActor)" },
-  );
-  function appAttempt(fn: () => void): Outcome {
+  const centralFor = (id: DesignId) => central.find((d) => d.id === id)!;
+  /** Run an insider trial on a hardened log and roll the log back afterwards, so trials stay independent. */
+  const isolated = (d: CentralDesign, fn: () => Outcome): Outcome => {
+    if (!(d instanceof HardenedDesign)) return fn();
+    const snap = d.snapshot();
     try {
-      fn();
-      return "undetected";
-    } catch (e) {
-      return e instanceof Unauthorized ? "prevented" : "undetected";
+      return fn();
+    } finally {
+      d.restore(snap);
+    }
+  };
+  const forCentral = (f: (d: CentralDesign, t: number) => Promise<Outcome> | Outcome) =>
+    Object.fromEntries((["editable", "hardened", "hardened-anchored"] as const).map((id) => [id, (t: number) => f(centralFor(id), t)])) as Record<Exclude<DesignId, "blockchain">, (t: number) => Promise<Outcome> | Outcome>;
+  const commitEntrySeq = (d: HardenedDesign, id: number) => (d.db.prepare("SELECT seq FROM entries WHERE kind = 'commit' AND subject = ?").get(id) as any).seq as number;
+  const chainPkg = async (cid: number) => {
+    const owner = store.get("SELECT researcher_id FROM reports WHERE cid = ?", cid)!.researcher_id;
+    const p: any = await svc.recoveryPackage(v(owner), cid);
+    delete p.receipt;
+    delete p.warning;
+    return p;
+  };
+
+  // S1 -----------------------------------------------------------------------------------
+  await scenario("S1", "Valid commitment followed by a matching reveal", "Honest researcher and reviewer", "functional", {
+    ...forCentral((d) => {
+      const { id } = freshCentral(d, "basalt", 1);
+      return d.sub(id)!.status === ST.REVEALED ? "passed" : "failed";
+    }),
+    blockchain: async () => {
+      const cid = await freshChain("basalt", 1);
+      return (await svc.commitmentOnChain(cid)).status === ST.REVEALED ? "passed" : "failed";
+    },
+  });
+
+  // S2 -----------------------------------------------------------------------------------
+  await scenario("S2", "Reveal containing modified report material", "Researcher reveals content edited after committing", "attack", {
+    ...forCentral((d) => {
+      const { id, pkg } = freshCentral(d, "quillfox", 2, syntheticReport(1001), false);
+      return d.reveal(TRIAGE[2], id, edited(pkg)) === "mismatch" ? "detected" : "undetected";
+    }),
+    blockchain: async () => {
+      const cid = await freshChain("quillfox", 2, syntheticReport(1001), false);
+      const s = await svc.submitReveal(v("quillfox"), cid, { mode: "edited", edits: { impact: "Exaggerated after the fact." } });
+      const r = await svc.verifyReveal(v(TRIAGE[2]), s.revealId);
+      return r.outcome === "mismatch" ? "detected" : "undetected";
+    },
+  }, { editable: "Commitment check is cryptography, not storage: every design that keeps a commitment detects this" });
+
+  // S3 -----------------------------------------------------------------------------------
+  await scenario("S3", "Operator rewrites a stored commitment so a modified reveal is accepted", "Operator with database and signing-key access, colluding with the researcher", "attack", {
+    ...forCentral((d) => isolated(d, () => {
+      const { id, pkg } = freshCentral(d, "nightjar", 3, syntheticReport(1002), false);
+      const bad = edited(pkg);
+      const forged = computeCommitment({ chainId: OFFCHAIN_CHAIN_ID, contract: OPERATOR_CONTRACT, researcher: pkg.researcher, programId: 3, policyVersion: 1 }, fieldsDigest(bad.report), pkg.nonce);
+      if (d instanceof EditableDesign) d.db.prepare("UPDATE submissions SET commitment = ? WHERE id = ?").run(forged, id);
+      else d.consistentRewrite(commitEntrySeq(d, id), (e) => (e.data.commitment = forged));
+      const accepted = d.reveal(TRIAGE[3], id, bad) === "match";
+      if (!accepted) return "prevented";
+      return d.audit().length ? "detected" : "undetected";
+    })),
+    blockchain: async () => {
+      const cid = await freshChain("nightjar", 3, syntheticReport(1002), false);
+      const pkg = await chainPkg(cid);
+      const bad = edited(pkg);
+      const forged = computeCommitment({ chainId: ledger.chainId, contract: ledger.address, researcher: pkg.researcher, programId: 3, policyVersion: pkg.policyVersion }, fieldsDigest(bad.report), pkg.nonce);
+      lab.alterCommitment(cid);
+      store.run("UPDATE reports SET commitment = ? WHERE cid = ?", forged, cid);
+      const s = await svc.submitReveal(v("nightjar"), cid, { mode: "package", package: bad });
+      const r = await svc.verifyReveal(v(TRIAGE[3]), s.revealId);
+      lab.restoreAll();
+      return r.outcome === "match" ? "undetected" : "prevented";
+    },
+  }, { hardened: "The operator holds the signing key, so a consistent rewrite re-signs cleanly", blockchain: "Verification uses the on-chain commitment; the off-chain edit is also flagged by the audit" });
+
+  // S4 -----------------------------------------------------------------------------------
+  await scenario("S4", "Attempted replacement of an earlier commitment", "Researcher replaces a committed report through the normal write path", "attack", {
+    ...forCentral((d) => {
+      const { id } = freshCentral(d, "basalt", 2, syntheticReport(1003), false);
+      const before = d.sub(id)!.commitment;
+      d.revise("basalt", id, "0x" + "ab".repeat(32), new Uint8Array(1));
+      // is the original commitment still on record, unchanged?
+      return d.sub(id)!.commitment === before ? "prevented" : "undetected";
+    }),
+    blockchain: async () => {
+      const cid = await freshChain("basalt", 2, syntheticReport(1003), false);
+      const before = await svc.commitmentOnChain(cid);
+      await svc.reviseReport(v("basalt"), cid, { ...syntheticReport(1004) });
+      const after = await svc.commitmentOnChain(cid);
+      const pkg = await chainPkg(cid);
+      const stillOpens = await ledger.read<boolean>("verifyOpening", cid, fieldsDigest(pkg.report), pkg.nonce);
+      return after.commitment === before.commitment && after.anchoredAt === before.anchoredAt && stillOpens ? "prevented" : "undetected";
+    },
+  }, { editable: "A conventional edit updates the row in place; the earlier commitment is no longer retrievable", hardened: "Revision is appended; the original entry stays", blockchain: "reviseCommitment() creates a new commitment; the original keeps its time and can still be opened" });
+
+  // S5 -----------------------------------------------------------------------------------
+  await scenario("S5", "Two reports associated with the same issue family by qualified reviewers", "Normal workflow: proposal by one program, independent review by the other", "functional", {
+    ...forCentral((d) => {
+      const a = freshCentral(d, "basalt", 1).id;
+      const b = freshCentral(d, "quillfox", 2).id;
+      const aid = d.propose(TRIAGE[1], a, b, RELATION.SAME_ISSUE);
+      let self = false;
+      try {
+        d.review(TRIAGE[1], aid, true);
+      } catch (e) {
+        self = e instanceof Rejected;
+      }
+      const fam = d.review(TRIAGE[2], aid, true);
+      return self && !!fam ? "passed" : "failed";
+    }),
+    blockchain: async () => {
+      const a = await freshChain("basalt", 1);
+      const b = await freshChain("quillfox", 2);
+      const { aid } = await svc.proposeAssociation(v(TRIAGE[1]), a, b, RELATION.SAME_ISSUE, "same root cause");
+      const self = await rejected(() => svc.reviewAssociation(v(TRIAGE[1]), aid, true, "self"));
+      await svc.reviewAssociation(v(TRIAGE[2]), aid, true, "confirmed");
+      const fam = (await svc.commitmentOnChain(a)).family;
+      return self && fam === (await svc.commitmentOnChain(b)).family && /[1-9a-f]/.test(fam.slice(2)) ? "passed" : "failed";
+    },
+  });
+
+  // S6 -----------------------------------------------------------------------------------
+  await scenario("S6", "Two similar-looking reports classified as distinct", "Normal workflow; nothing may be merged automatically", "functional", {
+    ...forCentral((d) => {
+      const f = syntheticReport(1005);
+      const a = freshCentral(d, "basalt", 1, f).id;
+      const b = freshCentral(d, "nightjar", 3, syntheticReport(1006, f)).id;
+      const aid = d.propose(TRIAGE[3], a, b, RELATION.DISTINCT);
+      const fam = d.review(TRIAGE[1], aid, true);
+      return fam === null ? "passed" : "failed";
+    }),
+    blockchain: async () => {
+      const f = syntheticReport(1005);
+      const a = await freshChain("basalt", 1, f);
+      const b = await freshChain("nightjar", 3, syntheticReport(1006, f));
+      const { aid } = await svc.proposeAssociation(v(TRIAGE[3]), a, b, RELATION.DISTINCT, "different root causes");
+      await svc.reviewAssociation(v(TRIAGE[1]), aid, true, "agreed: distinct");
+      const fam = (await svc.commitmentOnChain(a)).family;
+      return /^0x0+$/.test(fam) ? "passed" : "failed";
+    },
+  }, { blockchain: "Hashes of similar reports are unrelated; only a reviewed SAME_ISSUE association creates a family token" });
+
+  // S7 -----------------------------------------------------------------------------------
+  await scenario("S7", "Report content disclosed before the process permits it", "Reviewer reads before the reveal; researcher reveals before it is requested", "attack", {
+    ...forCentral((d) => {
+      const { receipt, pkg } = centralCommit(d, "quillfox", 1, syntheticReport(1007));
+      const read = d.canRead(TRIAGE[1], receipt.id);
+      let early = false;
+      try {
+        d.reveal(TRIAGE[1], receipt.id, pkg);
+      } catch (e) {
+        early = e instanceof Rejected;
+      }
+      return !read && early ? "prevented" : "undetected";
+    }),
+    blockchain: async () => {
+      const r = await svc.commitReport(v("quillfox"), { ...syntheticReport(1007), programId: 1 }, undefined, { withReceipt: false });
+      const view = await svc.reportView(v(TRIAGE[1]), r.cid);
+      const early = await rejected(() => svc.submitReveal(v("quillfox"), r.cid, { mode: "vault" }));
+      return !view.access.allowed && view.content === null && early ? "prevented" : "undetected";
+    },
+  }, { editable: "Enforced by the same application rule in every design; content is sealed at rest in all of them" });
+
+  // dispute fixture: a decided round-1 priority dispute between programs 1 and 2
+  const decidedCentral = (d: CentralDesign) => {
+    const a = freshCentral(d, "basalt", 1).id;
+    const b = freshCentral(d, "quillfox", 2).id;
+    const aid = d.propose(TRIAGE[1], a, b, RELATION.SAME_ISSUE);
+    d.review(TRIAGE[2], aid, true);
+    const did = d.openDispute("quillfox", DISPUTE_KIND.PRIORITY, aid);
+    return { did };
+  };
+  const decidedChain = async (votes = 2) => {
+    const a = await freshChain("basalt", 1);
+    const b = await freshChain("quillfox", 2);
+    const { aid } = await svc.proposeAssociation(v(TRIAGE[1]), a, b, RELATION.SAME_ISSUE, "same");
+    await svc.reviewAssociation(v(TRIAGE[2]), aid, true, "ok");
+    const { did } = await svc.openDispute(v("quillfox"), DISPUTE_KIND.PRIORITY, aid, "priority");
+    for (const arb of ["arb-holm", "arb-okafor"].slice(0, votes)) await svc.vote(v(arb), did, DECISION.PRIORITY_FIRST, 100, "first");
+    return { did };
+  };
+
+  // S8 -----------------------------------------------------------------------------------
+  await scenario("S8", "Unauthorized attempt to change a recorded decision", "Operator edits the decision (and covers its tracks) after arbitration", "attack", {
+    ...forCentral((d) => isolated(d, () => {
+      const { did } = decidedCentral(d);
+      for (const arb of ["arb-holm", "arb-okafor"]) d.vote(arb, did, DECISION.PRIORITY_FIRST, 100);
+      if (d instanceof EditableDesign) {
+        d.db.prepare("UPDATE disputes SET decision = ? WHERE id = ?").run(DECISION.PRIORITY_SECOND, did);
+        d.db.prepare("UPDATE votes SET decision = ? WHERE did = ?").run(DECISION.PRIORITY_SECOND, did);
+      } else {
+        for (const e of d.entries().filter((x) => x.kind === "vote" && x.subject === did)) d.consistentRewrite(e.seq, (m) => (m.data.decision = DECISION.PRIORITY_SECOND));
+      }
+      const changed = d.decisionHistory(did)[1] === DECISION.PRIORITY_SECOND;
+      if (!changed) return "prevented";
+      return d.audit().length ? "detected" : "undetected";
+    })),
+    blockchain: async () => {
+      const { did } = await decidedChain();
+      store.run("UPDATE disputes SET decision = ? WHERE did = ?", DECISION.PRIORITY_SECOND, did);
+      const forged = await rejected(() => ledger.send("outsider", "vote", [did, DECISION.PRIORITY_SECOND, 110, "0x" + "11".repeat(32)]));
+      const onchain = await svc.disputeOnChain(did);
+      store.run("UPDATE disputes SET decision = ? WHERE did = ?", onchain.decision, did);
+      return onchain.decision === DECISION.PRIORITY_FIRST && forged ? "prevented" : "undetected";
+    },
+  }, { "hardened-anchored": "Rewriting checkpointed entries breaks the externally held head", blockchain: "The decision of record is on-chain; editing the off-chain copy is flagged (DISPUTE_MIRROR_ALTERED)" });
+
+  // S9 -----------------------------------------------------------------------------------
+  await scenario("S9", "Dispute followed by a valid appeal", "Normal workflow; both rounds must remain retrievable", "functional", {
+    ...forCentral((d) => {
+      const { did } = decidedCentral(d);
+      for (const arb of ["arb-holm", "arb-okafor"]) d.vote(arb, did, DECISION.PRIORITY_FIRST, 100);
+      d.appeal("quillfox", did);
+      for (const arb of ["arb-vance", "arb-sato"]) d.vote(arb, did, DECISION.SHARED, 110);
+      const h = d.decisionHistory(did);
+      return h[1] === DECISION.PRIORITY_FIRST && h[2] === DECISION.SHARED ? "passed" : "failed";
+    }),
+    blockchain: async () => {
+      const { did } = await decidedChain();
+      await svc.appeal(v("quillfox"), did, "appeal");
+      for (const arb of ["arb-vance", "arb-sato"]) await svc.vote(v(arb), did, DECISION.SHARED, 110, "shared");
+      const d = await svc.disputeOnChain(did);
+      return d.firstDecision === DECISION.PRIORITY_FIRST && d.decision === DECISION.SHARED && d.status === 4 && d.reversed ? "passed" : "failed";
+    },
+  }, { editable: "Honest operation keeps the round-1 votes, so both rounds can be reconstructed" });
+
+  // S10 ----------------------------------------------------------------------------------
+  await scenario("S10", "Attempt to hide an earlier status event", "Operator removes the record of a failed reveal check", "attack", {
+    ...forCentral((d) => isolated(d, () => {
+      const { id, pkg } = freshCentral(d, "nightjar", 1, syntheticReport(1008), false);
+      d.reveal(TRIAGE[1], id, edited(pkg));
+      d.reveal(TRIAGE[1], id, pkg);
+      if (d instanceof EditableDesign) {
+        d.db.prepare("UPDATE submissions SET mismatches = 0 WHERE id = ?").run(id);
+        d.db.prepare("DELETE FROM status_log WHERE sid = ? AND to_status = -1").run(id);
+      } else {
+        const e = d.entries().find((x) => x.kind === "mismatch" && x.subject === id)!;
+        d.consistentDelete(e.seq);
+      }
+      if (d.sub(id)!.mismatches > 0) return "prevented";
+      return d.audit().length ? "detected" : "undetected";
+    })),
+    blockchain: async () => {
+      const cid = await freshChain("nightjar", 1, syntheticReport(1008), false);
+      const bad = await svc.submitReveal(v("nightjar"), cid, { mode: "edited", edits: { impact: "Exaggerated after the fact." } });
+      await svc.verifyReveal(v(TRIAGE[1]), bad.revealId);
+      const good = await svc.submitReveal(v("nightjar"), cid, { mode: "vault" });
+      await svc.verifyReveal(v(TRIAGE[1]), good.revealId);
+      const ev = store.get("SELECT seq FROM chain_events WHERE kind = 8 AND subject = ? ORDER BY seq LIMIT 1", String(cid))!;
+      lab.deleteEvent(ev.seq);
+      store.run("UPDATE reports SET mismatches = 0 WHERE cid = ?", cid);
+      const onchain = await svc.commitmentOnChain(cid);
+      lab.restoreAll();
+      store.run("UPDATE reports SET mismatches = ? WHERE cid = ?", onchain.mismatches, cid);
+      return onchain.mismatches === 1 ? "prevented" : "undetected";
+    },
+  }, { hardened: "Consistent deletion renumbers and re-signs the log", blockchain: "The mismatch count and log entry are on-chain; deleting the off-chain copy is flagged (MIRROR_EVENT_MISSING)" });
+
+  // S11 ----------------------------------------------------------------------------------
+  const s11Kind = (t: number) => ["conflicted arbitrator votes", "arbitrator votes twice", "operator forges a vote in an arbitrator's name"][t % 3];
+  await scenario("S11", "Conflicted or compromised reviewer attempts to adjudicate", "Rotates: conflicted arbitrator; duplicate vote; operator-forged vote", "attack", {
+    ...forCentral((d, t) => isolated(d, () => {
+      const { did } = decidedCentral(d);
+      const k = t % 3;
+      const attempt = (fn: () => void): Outcome => {
+        try {
+          fn();
+          return "undetected";
+        } catch (e) {
+          return e instanceof Rejected ? "prevented" : "undetected";
+        }
+      };
+      if (k === 0) return attempt(() => d.vote("arb-reyes", did, DECISION.PRIORITY_FIRST, 100));
+      d.vote("arb-holm", did, DECISION.PRIORITY_FIRST, 100);
+      if (k === 1) return attempt(() => d.vote("arb-holm", did, DECISION.PRIORITY_FIRST, 100));
+      if (d instanceof EditableDesign) d.db.prepare("INSERT INTO votes(did, round, arbitrator, decision, reason) VALUES (?, 1, 'arb-okafor', ?, 100)").run(did, DECISION.PRIORITY_FIRST);
+      else d.forge("vote", did, "arb-okafor", { round: 1, decision: DECISION.PRIORITY_FIRST, reason: 100 });
+      const decided = d.decisionHistory(did)[1] === DECISION.PRIORITY_FIRST;
+      return !decided ? "prevented" : d.audit().length ? "detected" : "undetected";
+    })),
+    blockchain: async (t) => {
+      const { did } = await decidedChain(0);
+      const k = t % 3;
+      if (k === 0) return (await rejected(() => svc.vote(v("arb-reyes"), did, DECISION.PRIORITY_FIRST, 100, "conflicted"))) ? "prevented" : "undetected";
+      await svc.vote(v("arb-holm"), did, DECISION.PRIORITY_FIRST, 100, "first");
+      if (k === 1) return (await rejected(() => svc.vote(v("arb-holm"), did, DECISION.PRIORITY_FIRST, 100, "again"))) ? "prevented" : "undetected";
+      const forged = await rejected(() => ledger.send("outsider", "vote", [did, DECISION.PRIORITY_FIRST, 100, "0x" + "22".repeat(32)]));
+      return forged && (await svc.disputeOnChain(did)).status === 1 ? "prevented" : "undetected";
+    },
+  }, { editable: "Conflict and duplicate-vote rules are enforced by every design; only forged attribution separates them", blockchain: "The operator has no arbitrator's key, so a forged vote cannot be signed" });
+
+  // S12 ----------------------------------------------------------------------------------
+  const s12Kind = (t: number) => ["missing field", "altered commitment", "holder backdates the receipt", "operator issues a backdated receipt"][t % 4];
+  await scenario("S12", "Receipt presented with missing or mismatched information", "Rotates: missing field; altered commitment; holder backdating; operator-issued backdated receipt", "attack", {
+    ...forCentral((d, t) => isolated(d, () => {
+      const { receipt } = centralCommit(d, "basalt", 2, syntheticReport(1100 + t));
+      const k = t % 4;
+      let presented: Partial<Receipt> = { ...receipt };
+      if (k === 0) delete presented.commitment;
+      if (k === 1) presented.commitment = "0x" + "cd".repeat(32);
+      if (k === 2) presented.createdAt = receipt.createdAt - 86400;
+      if (k === 3) {
+        if (d instanceof EditableDesign) d.db.prepare("UPDATE submissions SET created_at = created_at - 86400 WHERE id = ?").run(receipt.id);
+        else d.consistentRewrite(commitEntrySeq(d, receipt.id), (m) => (m.ts -= 86400));
+        presented = d.receipt(receipt.id);
+      }
+      return d.verifyReceipt(presented) ? "undetected" : "detected";
+    })),
+    blockchain: async (t) => {
+      const r = await svc.commitReport(v("basalt"), { ...syntheticReport(1100 + t), programId: 2 }, undefined, { withReceipt: false });
+      const receipt: any = await svc.receipt(v("basalt"), r.cid);
+      const k = t % 4;
+      if (k === 0) delete receipt.commitment;
+      if (k === 1) receipt.commitment = "0x" + "cd".repeat(32);
+      if (k >= 2) receipt.anchoredAt -= 86400;
+      const res = await verifyChainReceipt(receipt, ledger.provider);
+      return res.verdict === "valid" ? "undetected" : "detected";
+    },
+  }, { editable: "Unsigned receipts are checked against the operator's own database, so an operator-issued backdated receipt passes", blockchain: "Block times are set by the chain, not by the record-keeping operator" });
+
+  // ------------------------------------------------------------------ disclosure (inspected)
+  log("inspecting what each design discloses…");
+  const titles = workload.map((w) => w.fields.title.match(/ref-[0-9a-f]+/)![0]);
+  const nonces: string[] = store.all("SELECT cid, sealed FROM reports").map((r) => (vault.openJson<any>("report", `report:${r.cid}`, r.sealed).nonce as string).slice(2).toLowerCase());
+  // everything a consortium node holds: all transaction input data and all logs
+  let chainBlob = "";
+  const head = await ledger.provider.getBlockNumber();
+  for (let n = 1; n <= head; n++) {
+    const b = await ledger.provider.getBlock(n, true);
+    for (const tx of b?.prefetchedTransactions ?? []) {
+      chainBlob += tx.data.toLowerCase();
+      const rc = await ledger.provider.getTransactionReceipt(tx.hash);
+      for (const l of rc?.logs ?? []) chainBlob += l.data.toLowerCase() + l.topics.join("").toLowerCase();
     }
   }
-
-  // S7 — insider forges a record attributed to an authorized party
-  await scenario(
-    "S7",
-    "Insider forges a record in an authorized party's name",
-    "Operator of the record store inserts a well-formed repair record attributed to an authorized repairer, without that repairer's key",
-    "attack",
-    claimItems,
-    {
-      editable: (t) => {
-        const dev = devName(t.device);
-        const before = errs(editable.verify(dev));
-        const seq = editable.rows(dev).length;
-        editable.db.prepare("INSERT INTO records VALUES (?,?,?,?,?,?,?,?,?)").run(dev, seq, "REPAIR", "repairer-a", JSON.stringify({ description: "forged" }), null, null, null, new Date().toISOString());
-        const o = errs(editable.verify(dev)) > before ? "detected" : "undetected";
-        editable.db.prepare("DELETE FROM records WHERE device=? AND seq=?").run(dev, seq);
-        return o;
-      },
-      hardened: (t) => forge(hardened, t),
-      "hardened-anchored": (t) => forge(anchored, t),
-      blockchain: async (t) => {
-        const device = svc.store.getDevice(pid[t.device])!;
-        try {
-          await ledger.appendRecord("outsider", { deviceKey: device.device_key, recordType: typeCode("REPAIR"), payloadDigest: device.device_key, refSeq: NO_REF });
-          return "undetected";
-        } catch {
-          // fall back to an off-chain-only forgery and see whether the checker notices
-          const n = svc.store.listEvents(pid[t.device]).length;
-          const tmpl = svc.store.listEvents(pid[t.device])[n - 1];
-          svc.store.insertEvent({ ...tmpl, seq: n, type: "REPAIR", actor_id: "repairer-a", actor_address: ledger.addressOf("repairer-a") });
-          const detected = (await bcErrs(t.device)) > 0;
-          svc.store.db.prepare("DELETE FROM events WHERE public_id=? AND seq=?").run(pid[t.device], n);
-          return detected ? "prevented" : "undetected";
-        }
-      },
-    },
-    {
-      hardened: "Hash chains without per-party signatures cannot attribute records; the forged record is correctly hashed",
-      blockchain: "The insider lacks the repairer's key, so the transaction reverts; an off-chain-only row is flagged UNANCHORED_RECORD",
-    },
-  );
-  function forge(st: HardenedStore, t: Item): Outcome {
-    const dev = devName(t.device), snap = st.snapshot(dev);
-    st.forgeAppend("repairer-a", dev, "REPAIR", { description: "forged" }, null);
-    const o = errs(st.verify(dev)) > 0 ? "detected" : "undetected";
-    st.restore(dev, snap);
-    return o;
+  const asHex = (s: string) => Buffer.from(s, "utf8").toString("hex");
+  const titleLeaks = titles.filter((t) => chainBlob.includes(asHex(t))).length;
+  // positive control: the same search must find what *is* on-chain (the commitment hashes)
+  const commitmentsFound = idOf.blockchain.map((cid) => store.get("SELECT commitment FROM reports WHERE cid = ?", cid)!.commitment.slice(2).toLowerCase()).filter((c) => chainBlob.includes(c)).length;
+  const nonceLeaks = nonces.filter((n) => chainBlob.includes(n)).length;
+  const fileLeaks = (file: string) => {
+    const raw = fs.readFileSync(file).toString("latin1");
+    return titles.filter((t) => raw.includes(t)).length;
+  };
+  const anchoredEvents = await ledger.contract.queryFilter(ledger.contract.filters.CommitmentAnchored(), 0, "latest");
+  const programsBy = new Map<string, Set<number>>();
+  for (const e of anchoredEvents as any[]) {
+    const s = programsBy.get(e.args.researcher) ?? new Set<number>();
+    s.add(Number(e.args.programId));
+    programsBy.set(e.args.researcher, s);
   }
+  const crossLinked = [...programsBy.values()].filter((s) => s.size > 1).length;
+  const families = new Set((await svc.snapshot()).commitments.map((c) => c.family).filter((f) => !/^0x0+$/.test(f))).size;
+  const nDisputes = Number(await ledger.read("disputeCount"));
+  const operatorOnly = "operator only (not shared)";
+  const disclosure = [
+    { item: "Report text found in data shared with other participants", designs: { editable: operatorOnly, hardened: "operator only (signed receipts carry hashes)", "hardened-anchored": "operator only (checkpoints carry one head hash)", blockchain: `${titleLeaks} of ${titles.length} report markers found in all transaction data and logs (control: ${commitmentsFound} of ${titles.length} commitment hashes found by the same search)` } },
+    { item: "Secret nonces found in data shared with other participants", designs: { editable: operatorOnly, hardened: operatorOnly, "hardened-anchored": operatorOnly, blockchain: `${nonceLeaks} of ${nonces.length} nonces found in all transaction data and logs` } },
+    { item: "Report text readable in the database file without the vault key", designs: { editable: `${fileLeaks(editable.file)} of ${titles.length}`, hardened: `${fileLeaks(path.join(tmp, "hardened.sqlite"))} of ${titles.length}`, "hardened-anchored": `${fileLeaks(path.join(tmp, "hardened-anchored.sqlite"))} of ${titles.length}`, blockchain: `${fileLeaks(path.join(tmp, "blockchain-offchain.sqlite"))} of ${titles.length}` } },
+    { item: "Who can read report text with the vault key", designs: { editable: "operator", hardened: "operator", "hardened-anchored": "operator", blockchain: "operator of the off-chain store (prototype keeps vaults server-side)" } },
+    { item: "Commitment hashes and submission times", designs: { editable: "operator; receipt holder", hardened: "operator; receipt holder", "hardened-anchored": "operator; receipt holder", blockchain: `every consortium node (${anchoredEvents.length} commitments readable from events)` } },
+    { item: "Same researcher linkable across programs", designs: { editable: operatorOnly, hardened: operatorOnly, "hardened-anchored": operatorOnly, blockchain: `every consortium node: ${crossLinked} of ${programsBy.size} researcher addresses appear in more than one program` } },
+    { item: "Issue-family linkage between submissions", designs: { editable: operatorOnly, hardened: operatorOnly, "hardened-anchored": operatorOnly, blockchain: `every consortium node (${families} family token(s))` } },
+    { item: "Dispute existence, votes and reason codes", designs: { editable: operatorOnly, hardened: operatorOnly, "hardened-anchored": operatorOnly, blockchain: `every consortium node (${nDisputes} disputes)` } },
+  ];
 
-  // S8 — hide or overwrite an unresolved dispute
-  await scenario(
-    "S8",
-    "Attempt to hide or overwrite an unresolved dispute",
-    "A buyer's challenge is open; the record-store operator tries to make it disappear (status edit, forged resolution, or deletion)",
-    "attack",
-    claimItems.filter((c) => c.actor !== "buyer"),
-    {
-      editable: (t) => {
-        const dev = devName(t.device);
-        const id = editable.append("buyer", dev, "CHALLENGE", { reason: "benchmark challenge" }, seqMap.editable.get(t.idx));
-        editable.db.prepare("UPDATE disputes SET status='resolved', resolver='auditor' WHERE id=?").run(id);
-        return editable.openDisputes(dev) === 0 && errs(editable.verify(dev)) === 0 ? "undetected" : "detected";
-      },
-      hardened: (t) => hideDispute(hardened, t, seqMap.hardened),
-      "hardened-anchored": (t) => hideDispute(anchored, t, seqMap["hardened-anchored"]),
-      blockchain: async (t) => {
-        const p = pid[t.device];
-        const device = svc.store.getDevice(p)!;
-        const target = seqMap.blockchain.get(t.idx)!;
-        const ch = await svc.appendEvent("buyer", p, { type: "CHALLENGE", refSeq: target, reason: "benchmark challenge" });
-        let hidden = false;
-        try {
-          await svc.appendEvent("buyer", p, { type: "RESOLUTION", refSeq: ch.seq, outcome: "CLAIM_UPHELD", reason: "self-serving resolution" });
-          hidden = true;
-        } catch {
-          /* NotAuthorized */
-        }
-        lab.deleteRecord(p, ch.seq);
-        const stillOpen = Number(await ledger.contract.openDisputeCount(device.device_key)) > 0;
-        const flagged = (await bcErrs(t.device)) > 0;
-        lab.restoreAll();
-        // leave the dispute resolved properly so later trials start clean
-        await svc.appendEvent("auditor", p, { type: "RESOLUTION", refSeq: ch.seq, outcome: "INCONCLUSIVE", reason: "benchmark cleanup" });
-        return hidden ? "undetected" : stillOpen && flagged ? "prevented" : stillOpen || flagged ? "detected" : "undetected";
-      },
-    },
-    {
-      editable: "Dispute status is an editable column",
-      hardened: "A correctly hashed resolution forged in the auditor's name is indistinguishable from a real one",
-      blockchain: "Non-auditor resolution reverts; open-dispute state lives in the contract; deleting the off-chain copy is flagged",
-    },
-  );
-  function hideDispute(st: HardenedStore, t: Item, sm: Map<number, number>): Outcome {
-    const dev = devName(t.device), snap = st.snapshot(dev);
-    const ch = st.append("buyer", dev, "CHALLENGE", { reason: "benchmark challenge" }, sm.get(t.idx));
-    st.forgeAppend("auditor", dev, "RESOLUTION", { outcome: "CLAIM_UPHELD", reason: "forged" }, ch);
-    const o = st.openDisputes(dev) === 0 && errs(st.verify(dev)) === 0 ? "undetected" : "detected";
-    st.restore(dev, snap);
-    return o;
-  }
-
-  // S9 — evidence digest reuse
-  await scenario(
-    "S9",
-    "Reuse of a previously submitted evidence digest",
-    "A byte-identical receipt is submitted again for a different device",
-    "detection",
-    evItems,
-    {
-      editable: (t) => (editable.reuseCount(sha(t.evidence!)) > 0 ? "detected" : "undetected"),
-      hardened: (t) => (hardened.reuseCount(sha(t.evidence!)) > 0 ? "detected" : "undetected"),
-      "hardened-anchored": (t) => (anchored.reuseCount(sha(t.evidence!)) > 0 ? "detected" : "undetected"),
-      blockchain: (t) => {
-        const other = pid[(t.device + 1) % DEVICES];
-        const r = svc.uploadEvidence("repairer-a", other, { buffer: t.evidence!, originalname: "reused.txt", mimetype: "text/plain" }, { kind: "purchase-receipt" });
-        return r.warnings.length > 0 ? "detected" : "undetected";
-      },
-    },
-    { editable: "Same digest-lookup query in every store: an analysis feature, not a blockchain property" },
-  );
-
-  // S10 — conflicting component claims
-  const devicesPool = Array.from({ length: DEVICES }, (_, d) => workload.find((w) => w.device === d && w.type === "REGISTRATION")!);
-  await scenario(
-    "S10",
-    "Conflicting claims about a component replacement",
-    "One repairer records a battery replacement; a later inspection asserts the original battery",
-    "detection",
-    devicesPool,
-    {
-      editable: (t) => conflictTrial(editable, devName(t.device)),
-      hardened: (t) => conflictTrial(hardened, devName(t.device)),
-      "hardened-anchored": (t) => conflictTrial(anchored, devName(t.device)),
-      blockchain: async (t) => {
-        const p = pid[t.device];
-        const before = (await svc.getPassport(p)).conflicts.filter((c) => c.status === "open").length;
-        await svc.appendEvent("repairer-a", p, { type: "COMPONENT_REPLACEMENT", component: "battery", partOrigin: "new-compatible", description: "bench replacement", result: "replaced" });
-        await svc.appendEvent("inspector", p, { type: "INSPECTION", description: "bench inspection", result: "pass", componentAssertions: [{ component: "battery", state: "original" }] });
-        const after = (await svc.getPassport(p)).conflicts.filter((c) => c.status === "open").length;
-        return after > before ? "detected" : "undetected";
-      },
-    },
-  );
-  function conflictTrial(st: EditableStore | HardenedStore, dev: string): Outcome {
-    const before = st.conflicts(dev);
-    st.append("repairer-a", dev, "COMPONENT_REPLACEMENT", { component: "battery", componentAssertions: [{ component: "battery", state: "replaced" }] });
-    st.append("inspector", dev, "INSPECTION", { componentAssertions: [{ component: "battery", state: "original" }] });
-    return st.conflicts(dev) > before ? "detected" : "undetected";
-  }
-
-  // S11 — correction preserves history
-  const corrected = new Set(workload.filter((w) => w.type === "CORRECTION").map((w) => w.refIdx));
-  await scenario(
-    "S11",
-    "Correction preserves the earlier claim",
-    "The original author corrects a claim through the normal write path; is the original wording still retrievable?",
-    "preservation",
-    shuffled(claimItems.filter((c) => !corrected.has(c.idx))).slice(0, TRIALS),
-    {
-      editable: (t) => preserveTrial(editable, t, seqMap.editable),
-      hardened: (t) => preserveTrial(hardened, t, seqMap.hardened),
-      "hardened-anchored": (t) => preserveTrial(anchored, t, seqMap["hardened-anchored"]),
-      blockchain: async (t) => {
-        const p = pid[t.device];
-        const seq = seqMap.blockchain.get(t.idx)!;
-        const original = svc.store.listEvents(p).find((e) => e.seq === seq)!.payload;
-        try {
-          await svc.appendEvent(t.actor, p, { type: "CORRECTION", refSeq: seq, reason: "benchmark correction", description: "corrected wording" });
-        } catch {
-          /* already superseded by an earlier trial: the original is still checked below */
-        }
-        const now = svc.store.listEvents(p).find((e) => e.seq === seq)!.payload;
-        return now === original ? "prevented" : "undetected";
-      },
-    },
-    { editable: "Conventional CRUD correction overwrites the claim in place", blockchain: "Correction is a new record; the original is unchanged on- and off-chain" },
-  );
-  function preserveTrial(st: EditableStore | HardenedStore, t: Item, sm: Map<number, number>): Outcome {
-    const dev = devName(t.device), seq = sm.get(t.idx)!;
-    const original = st.get(dev, seq).payload;
-    try {
-      st.append(t.actor, dev, "CORRECTION", { reason: "benchmark correction", corrected: { description: "corrected wording" } }, seq);
-    } catch {
-      /* ignore */
-    }
-    return st.get(dev, seq).payload === original ? "prevented" : "undetected";
-  }
-
-  // ---------------------------------------------------------------- output
+  // ------------------------------------------------------------------ output
   const result = {
-    schema: "patchledger.benchmark.v1",
+    schema: "vulnseal.benchmark.v1",
     generatedAt: new Date().toISOString(),
     config: {
-      devices: DEVICES,
-      eventsPerDevice: EVENTS,
+      reports: REPORTS,
       seed: SEED,
       trials: TRIALS,
-      totalRecords,
+      pairs: pairs.length,
       node: process.version,
       platform: process.platform,
       arch: process.arch,
@@ -807,33 +712,34 @@ try {
       hardhat: createRequire(import.meta.url)("hardhat/package.json").version,
       solc: "0.8.28 (optimizer 200 runs)",
     },
-    workload: { typeMix: Object.fromEntries(Object.entries(Object.groupBy(workload, (w) => w.type)).map(([k, v]) => [k, v!.length])), evidenceFiles: evItems.length },
-    baselineVerificationErrors: verifyFindings,
-    stores,
+    designs,
     scenarios,
+    scenarioRotation: { S11: [0, 1, 2].map(s11Kind), S12: [0, 1, 2, 3].map(s12Kind) },
+    disclosure,
     notes: [
-      "Measured directly: insert latency (one record, application path, excluding evidence-file upload), full-history verification latency per device, throughput (records ÷ summed insert time, single sequential client), SQLite size, gas and calldata from transaction receipts.",
-      "Simulated: attack outcomes. Each attack is actually executed against the store, then that store's own verifier is run. P = prevented (the operation was rejected), D = applied but detected, U = applied and not detected.",
-      "The local Hardhat chain automines every transaction instantly on one node; real deployments add block/consensus latency (seconds) and replication. Latencies here are lower bounds for the blockchain design.",
-      "Blockchain verification includes RPC reads of the on-chain records and re-hashing of evidence files, so it is not directly comparable to an in-process SQLite scan.",
-      "On-chain bytes per record are computed from the contract's storage layout, not measured from node disk usage.",
-      "Insider model: the attacker controls the off-chain database and file store but not other parties' signing keys. In this prototype the server holds all demo keys for convenience, which a production deployment must not do.",
-      "The hardened baseline with external checkpoints detects rewrites of already-checkpointed history as well as the blockchain does; its remaining gap is attribution (no per-party signatures) and the operator's ability to append records in others' names.",
+      "Measured directly: latency of committing (computing the commitment, sealing the report, recording it; for the blockchain design this includes signing, the RPC round trip and waiting for the receipt), status transitions, reveal checks and receipt verification; throughput = commits / summed commit time for one sequential client; SQLite sizes; gas and calldata from transaction receipts.",
+      "Simulated attacks: each scenario is executed against each design and the design's own verifier then runs. P = prevented (the attacker's goal was rejected), D = applied but detected, U = applied and not detected. Functional scenarios report whether the workflow behaved correctly.",
+      "Insider model: the operator controls the off-chain database, the evidence store, the vault key and (for the hardened designs) the log-signing key, but not other participants' private keys. The prototype server holds all demo keys for convenience; a deployment must not.",
+      "The local Hardhat chain automines each transaction instantly on one node. Real networks add block and consensus latency, so blockchain latencies here are lower bounds.",
+      "Blockchain receipt verification makes about a dozen RPC calls to the node; centralised verification is an in-process lookup. The numbers are not like-for-like.",
+      "On-chain bytes per submission come from the contract's storage layout, not from node disk usage; per-event on-chain storage is one 32-byte log-entry slot plus state updates.",
+      "The disclosure table is computed by scanning the stored data of each design and every transaction input and log on the chain for the synthetic report markers and nonces.",
       "Single run on one machine; results are descriptive. No statistical significance testing was performed; repeat with several seeds to assess variability.",
     ],
   };
   fs.mkdirSync(OUT, { recursive: true });
   const stamp = result.generatedAt.replace(/[:.]/g, "-");
-  const base = `benchmark-seed${SEED}-${DEVICES}x${EVENTS}-${stamp}`;
+  const base = `benchmark-seed${SEED}-${REPORTS}r-${stamp}`;
   const md = renderMarkdown(result);
-  fs.writeFileSync(path.join(OUT, base + ".json"), JSON.stringify(result, null, 2));
-  fs.writeFileSync(path.join(OUT, base + ".md"), md);
+  fs.writeFileSync(path.join(OUT, `${base}.json`), JSON.stringify(result, null, 2));
+  fs.writeFileSync(path.join(OUT, `${base}.md`), md);
   fs.writeFileSync(path.join(OUT, "latest.json"), JSON.stringify(result, null, 2));
   fs.writeFileSync(path.join(OUT, "latest.md"), md);
   log(`wrote ${path.relative(process.cwd(), path.join(OUT, base))}.{json,md} and latest.{json,md}`);
-  for (const s of stores) log(`${s.name.padEnd(28)} insert median ${s.insert.median.toFixed(3)} ms · verify median ${s.verify.median.toFixed(3)} ms · ${s.throughputPerSec.toFixed(0)} rec/s`);
-  for (const sc of scenarios) log(`${sc.id} ${STORE_IDS.map((id) => `${id}=${Math.round(sc.results[id].protectedRate * 100)}%`).join(" ")}`);
+  for (const d of designs) log(`${d.name.padEnd(24)} commit median ${d.metrics.commit.median.toFixed(3)} ms · receipt verify ${d.metrics.receiptVerify.median.toFixed(3)} ms · ${d.metrics.throughputCommitsPerSec.toFixed(0)} commits/s`);
+  for (const s of scenarios) log(`${s.id.padEnd(4)} ${DESIGNS.map((id) => { const r = s.results[id]; return `${id}=${s.kind === "functional" ? `${r.passed}/${r.trials}` : `${r.prevented}P${r.detected}D${r.undetected}U`}`; }).join(" ")}`);
   ledger.provider.destroy();
+  store.close();
 } catch (e) {
   console.error(e);
   exitCode = 1;
@@ -846,58 +752,42 @@ process.exit(exitCode);
 function renderMarkdown(r: any): string {
   const L: string[] = [];
   const f = (v: number | null) => (v === null ? "—" : v < 1 ? v.toFixed(3) : v.toFixed(2));
-  L.push(`# PatchLedger benchmark report`);
-  L.push("");
-  L.push(`Generated ${r.generatedAt} · seed ${r.config.seed} · ${r.config.devices} devices × ${r.config.eventsPerDevice} events = ${r.config.totalRecords} records per store · ${r.config.trials} trials per scenario`);
-  L.push(`Environment: Node ${r.config.node}, ${r.config.platform}/${r.config.arch}, ${r.config.cpu}, Hardhat ${r.config.hardhat}, solc ${r.config.solc}`);
-  L.push("");
-  L.push(`Workload mix: ${Object.entries(r.workload.typeMix).map(([k, v]) => `${k} ${v}`).join(", ")}; ${r.workload.evidenceFiles} evidence files.`);
-  L.push(`Baseline verification errors before attacks (expected 0): ${JSON.stringify(r.baselineVerificationErrors)}`);
-  L.push("");
-  L.push("## Performance and storage (direct measurements)");
-  L.push("");
-  L.push("| Store | Insert median ms | Insert p95 ms | Throughput rec/s | Verify median ms | Verify p95 ms | Off-chain B/rec | On-chain B/rec | Calldata B/rec | Mean gas/rec |");
-  L.push("|---|---|---|---|---|---|---|---|---|---|");
-  for (const s of r.stores)
-    L.push(
-      `| ${s.name} | ${f(s.insert.median)} | ${f(s.insert.p95)} | ${s.throughputPerSec.toFixed(0)} | ${f(s.verify.median)} | ${f(s.verify.p95)} | ${s.storage.offChainBytesPerRecord.toFixed(0)} | ${s.storage.onChainBytesPerRecord === null ? "—" : s.storage.onChainBytesPerRecord.toFixed(0)} | ${s.storage.calldataBytesPerRecord === null ? "—" : s.storage.calldataBytesPerRecord.toFixed(0)} | ${s.gas ? s.gas.meanPerRecord.toFixed(0) : "—"} |`,
-    );
-  L.push("");
-  L.push("p95 is reported only when n ≥ 20. Verification is per device (full history); n = number of devices.");
-  const g = r.stores.find((s: any) => s.gas)?.gas;
-  if (g) {
-    L.push("");
-    L.push(`### Gas by record type (deployment: ${g.deployment} gas)`);
-    L.push("");
-    L.push("| Record type | n | Median gas |");
-    L.push("|---|---|---|");
-    for (const [t, v] of Object.entries(g.perType) as any) L.push(`| ${t} | ${v.n} | ${v.median} |`);
+  L.push("# VulnSeal benchmark report", "");
+  L.push(`Generated ${r.generatedAt} · seed ${r.config.seed} · ${r.config.reports} synthetic reports · ${r.config.pairs} cross-program pairs · ${r.config.trials} trials per scenario`);
+  L.push(`Environment: Node ${r.config.node}, ${r.config.platform}/${r.config.arch}, ${r.config.cpu}, Hardhat ${r.config.hardhat}, solc ${r.config.solc}`, "");
+  L.push("## Performance and storage (direct measurements)", "");
+  L.push("| Design | Commit median ms | Commit p95 ms | Commits/s | Receipt verify median ms | Transition median ms | Reveal check median ms | Bytes/submission | Bytes/event | On-chain B/submission | Gas/commit |");
+  L.push("|---|---|---|---|---|---|---|---|---|---|---|");
+  for (const d of r.designs) {
+    const m = d.metrics;
+    L.push(`| ${d.name} | ${f(m.commit.median)} | ${f(m.commit.p95)} | ${m.throughputCommitsPerSec.toFixed(0)} | ${f(m.receiptVerify.median)} | ${f(m.transition.median)} | ${f(m.revealCheck.median)} | ${m.storage.bytesPerSubmission.toFixed(0)} | ${m.storage.bytesPerEvent.toFixed(0)} | ${m.storage.onChainBytesPerSubmission ?? "—"} | ${m.gas ? m.gas.meanPerSubmission.toFixed(0) : "—"} |`);
   }
-  L.push("");
-  L.push("## Attack and integrity scenarios (simulated attacks, actually executed)");
-  L.push("");
-  L.push("Cells: protected rate (prevented + detected) and counts P/D/U out of trials. For S11, P means the original claim was preserved.");
-  L.push("");
-  L.push(`| Scenario | ${r.stores.map((s: any) => s.name).join(" | ")} |`);
-  L.push(`|---|${r.stores.map(() => "---").join("|")}|`);
-  for (const sc of r.scenarios) {
+  const g = r.designs.find((d: any) => d.metrics.gas)?.metrics.gas;
+  if (g) {
+    L.push("", `### Gas by operation (median; deployment ${g.deployment} gas; mean ${g.meanPerTx.toFixed(0)} per transaction)`, "", "| Operation | Median gas |", "|---|---|");
+    for (const [k, v] of Object.entries(g.perOperation)) L.push(`| ${k} | ${v} |`);
+  }
+  L.push("", "## Scenarios (actually executed; attacks are simulated)", "", "Attack cells: protected rate and P/D/U counts. Functional cells: passed/trials.", "");
+  L.push(`| Scenario | ${r.designs.map((d: any) => d.name).join(" | ")} |`, `|---|${r.designs.map(() => "---").join("|")}|`);
+  for (const s of r.scenarios) {
     L.push(
-      `| **${sc.id}** ${sc.title} | ${r.stores
-        .map((s: any) => {
-          const x = sc.results[s.id];
-          return `${Math.round(x.protectedRate * 100)}% (${x.prevented}P/${x.detected}D/${x.undetected}U)`;
+      `| **${s.id}** ${s.title} | ${r.designs
+        .map((d: any) => {
+          const x = s.results[d.id];
+          return s.kind === "functional" ? `${x.passed}/${x.trials} pass` : `${Math.round(((x.prevented + x.detected) / x.trials) * 100)}% (${x.prevented}P/${x.detected}D/${x.undetected}U)`;
         })
         .join(" | ")} |`,
     );
   }
   L.push("");
-  for (const sc of r.scenarios) {
-    L.push(`- **${sc.id}** — attacker: ${sc.attacker}.`);
-    for (const s of r.stores) if (sc.results[s.id].note) L.push(`  - ${s.name}: ${sc.results[s.id].note}`);
+  for (const s of r.scenarios) {
+    L.push(`- **${s.id}** — ${s.attacker}.`);
+    for (const d of r.designs) if (s.results[d.id].note) L.push(`  - ${d.name}: ${s.results[d.id].note}`);
   }
-  L.push("");
-  L.push("## Notes and limitations");
-  L.push("");
+  L.push("", `S11 trials rotate through: ${r.scenarioRotation.S11.join("; ")}. S12 trials rotate through: ${r.scenarioRotation.S12.join("; ")}.`);
+  L.push("", "## Disclosure (computed by inspecting stored and on-chain data)", "", `| Item | ${r.designs.map((d: any) => d.name).join(" | ")} |`, `|---|${r.designs.map(() => "---").join("|")}|`);
+  for (const x of r.disclosure) L.push(`| ${x.item} | ${r.designs.map((d: any) => x.designs[d.id]).join(" | ")} |`);
+  L.push("", "## Notes and limitations", "");
   for (const n of r.notes) L.push(`- ${n}`);
   return L.join("\n") + "\n";
 }

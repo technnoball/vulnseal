@@ -1,95 +1,96 @@
 # Experiment protocol
 
-This protocol defines the benchmark in [`scripts/benchmark.ts`](../scripts/benchmark.ts) and [`scripts/lib/baselines.ts`](../scripts/lib/baselines.ts), which addresses RQ1 and RQ3. RQ2 (interpretability) is **not** evaluated empirically; see [research-gap.md §6](research-gap.md#6-demonstrated-results-hypotheses-and-future-work).
+This protocol defines the benchmark in [`scripts/benchmark.ts`](../scripts/benchmark.ts), which uses the baselines in [`scripts/lib/baselines.ts`](../scripts/lib/baselines.ts). It addresses RQ1–RQ3. RQ4 is answered analytically in [threat-model.md](threat-model.md).
 
-## Systems compared
+## Designs compared
 
-| ID | System | Integrity mechanism | Authorization |
+| ID | Design | Integrity mechanism | Authorisation |
 |----|--------|---------------------|---------------|
-| `editable` | Conventional CRUD SQLite | Evidence SHA-256 column; checks for gaps in sequence numbers. Corrections and dispute status are updated in place. | Application code, same rules as the contract |
-| `hardened` | Append-only SQLite | `BEFORE UPDATE/DELETE` triggers; SHA-256 hash chain over canonical records; evidence digests inside hashed payloads | Application code, same rules |
-| `hardened-anchored` | `hardened` plus external checkpoints | As above, plus the head hash and record count handed to an independent party after every write | Application code, same rules |
-| `blockchain` | PatchLedger contract plus off-chain SQLite (the real application service) | Contract-enforced append-only links; payload digests on-chain; evidence digests in committed payloads | Solidity contract, with per-party keys |
+| `editable` | Conventional editable SQLite submission record | Rows updated in place; an editable status log; unsigned receipts checked against the database | Application code, same rules as the contract |
+| `hardened` | Hardened centralised log | Every event is an append-only entry (UPDATE/DELETE blocked by triggers) in a SHA-256 hash chain, **signed by the operator's Ed25519 key**; operator-signed receipts | Application code, same rules |
+| `hardened-anchored` | Hardened log plus external checkpoints | As above, plus every new head is handed to an independent witness that **keeps all earlier heads** (like a transparency-log witness) | Application code, same rules |
+| `blockchain` | VulnSeal | The real contract and service on a dedicated throw-away Hardhat chain | Contract; each participant signs with its own key |
 
-The baselines are **deliberately not weakened**:
+**Fairness measures** (the baselines are not weakened):
 
-- They use the same role matrix (`authorize()` mirrors the contract).
-- They use the same canonical serialization and SHA-256 evidence hashing.
-- The hardened variants reject updates and deletes through triggers.
+- all four designs use the **same commitment construction** (field hashes, evidence root, 256-bit nonce);
+- all seal report content with the **same AES-256-GCM vault**;
+- all apply the **same role, transition, conflict and appeal rules**.
 
-## Workload
+During development, the checkpointed baseline first kept only its latest checkpoint. That made it miss rewrites of history the witness had already seen. It was corrected to keep every checkpoint before any result was reported.
 
-- `--devices N` (default 10) and `--events E` (default 8) per device. Each device has one registration plus E events.
-- Event mix (seeded): diagnostic 35%, repair 25%, component replacement 15%, inspection 17%, custody transfer 8%. About 8% of slots become corrections of an earlier claim by that claim's author.
-- 40% of non-custody events carry one synthetic evidence file (1.5–6 KB, unique content).
-- RNG: `mulberry32(--seed)`. The same workload is applied, in the same order, to all four systems.
-- The blockchain system runs on a **dedicated throw-away Hardhat node** on a free port, so the demo ledger is untouched.
+## Threat model for the experiment
+
+- **Insider:** the operator of the record store. They have database and file access and the vault key, and for the hardened designs they also hold the log-signing key. They do **not** hold other participants' private keys.
+- **Outsider or dishonest participant:** uses the normal write path (wrong role, conflicted arbitrator, a researcher altering a reveal).
+- **Out of scope:** attacks on the chain itself (node operator rewriting blocks, consensus capture), because there is a single local node; and cryptographic breaks.
+
+## Hypotheses
+
+- **H1 (RQ1):** every design that keeps a commitment detects a modified reveal. Only designs whose record of the commitment is outside the operator's control (checkpointed log, blockchain) also resist an operator rewriting the stored commitment.
+- **H2 (RQ2):** the checkpointed log matches the blockchain on detecting rewrites of witnessed history. Only the blockchain resists records forged *in another participant's name*, because that requires per-party signatures enforced outside the operator.
+- **H3 (RQ3):** the blockchain design costs at least an order of magnitude more latency per write than SQLite, even on an instantly-mining local chain. It also discloses more metadata to more parties (commitments, linkage, decisions), while disclosing no report content or nonces.
+
+These are checked descriptively against observed counts. No significance testing is done.
+
+## Workload (seeded)
+
+- `--reports N` (default 40) synthetic reports. Each has a random researcher (3) and a random program (3); 70% end valid and 30% invalid; each carries a unique marker `ref-<hex>` used by the disclosure scan.
+- Per report: commit → acknowledge → request reveal → reveal (match) → triage pending → triage valid/invalid.
+- `N/5` cross-program pairs: propose same-issue (program A staff) → review (program B staff) → priority dispute → two arbitrator votes.
+- `mulberry32(--seed)` drives every random choice. The same workload runs against every design in the same order.
 
 ## Metrics
 
 | Metric | Definition | Kind |
 |--------|-----------|------|
-| Insert latency | Wall-clock time of one application-path insert (`appendEvent` / `registerDevice` for blockchain, including canonicalization, signing, the RPC round trip, the receipt and the SQLite insert). Evidence upload is excluded for all systems. | **Measured** |
-| Median, p95 | Linear-interpolated quantiles; p95 is reported only when n ≥ 20 | Measured |
-| Throughput | Records ÷ sum of insert times, for a single sequential client | Measured |
-| Verification latency | Full-history verification per device using each system's own verifier (blockchain: RPC reads, `verifyChain()`, local recomputation, evidence re-hash) | Measured |
-| Off-chain storage per record | SQLite `page_count × page_size` after a WAL checkpoint, ÷ records. Evidence files are excluded. | Measured |
-| On-chain storage per record | Contract storage slots written × 32 B ÷ records (4 slots per record, plus per-device and per-correction mapping slots) | **Computed from the storage layout** |
-| Calldata per record | Transaction `data` length, from the node | Measured |
-| Gas | `receipt.gasUsed` per record type; mean per record; deployment gas | Measured |
-| Tamper detection rate | Over T trials per scenario: (prevented + detected) ÷ T | **Simulated attack, real execution** |
-| Unauthorized-operation rejection rate | Scenario S6 | Simulated attack, real execution |
-| Evidence integrity outcomes | Scenarios S4, S5, S9 | Simulated attack, real execution |
-| Trace completeness / dispute preservation | S11 (original preserved after correction), S8 (dispute not hideable) | Simulated, real execution |
+| Commit latency | Compute commitment and seal content, then record it. For the blockchain this includes signing, the RPC round trip, waiting for the receipt and the database write. Receipt building is timed separately | **Measured** |
+| Transition latency | One status change, association step or vote | Measured |
+| Reveal-check latency | Reviewer verifies a reveal and records the outcome | Measured |
+| Receipt verification latency | Verifier checks a receipt. Blockchain: about 12 RPC reads. Hardened: Ed25519 signature check plus hash recomputation, plus a full witnessed-checkpoint audit for the anchored variant. Editable: database comparison | Measured |
+| Median, p95 | Linear-interpolated quantiles; p95 only when n ≥ 20 | Measured |
+| Throughput | Commits ÷ summed commit time, one sequential client | Measured |
+| Storage | SQLite `page_count × page_size` after a WAL checkpoint, ÷ submissions and ÷ events. Blockchain on-chain bytes per submission come from the storage layout (7 slots) | Measured / **computed** |
+| Gas | `receipt.gasUsed` per contract function | Measured |
+| Scenario outcomes | Per trial: **P** prevented (the attacker's goal was rejected), **D** applied but detected by the design's own verifier, **U** applied and undetected. Functional scenarios: pass/fail | **Simulated attack, real execution** |
+| Disclosure | A byte scan of each design's stored data and of *all* transaction inputs and logs on the chain for report markers and nonces, with commitment hashes as a positive control; plus counts of linkable pseudonyms, family tokens and disputes | Measured by inspection |
 
-## Attack and integrity scenarios
+## Scenarios
 
-Each trial **actually performs** the attack: SQL statements, file writes, or real transactions. It then runs **that system's own verifier**, classifies the outcome, and restores the state.
+| ID | Scenario | Attacker / actor |
+|----|----------|------------------|
+| S1 | Valid commitment followed by a matching reveal | Honest (functional) |
+| S2 | Reveal containing modified report material | Researcher |
+| S3 | Operator rewrites a stored commitment so a modified reveal is accepted | Operator colluding with the researcher |
+| S4 | Attempted replacement of an earlier commitment | Researcher via the normal path |
+| S5 | Same-issue association by qualified reviewers, with self-review refused | Functional |
+| S6 | Similar-looking reports classified distinct; nothing auto-merged | Functional |
+| S7 | Content disclosed before the process permits (early read, early reveal) | Reviewer and researcher |
+| S8 | Unauthorized change of a recorded decision | Operator |
+| S9 | Dispute followed by a valid appeal; both rounds retrievable | Functional |
+| S10 | Hiding an earlier status event (a failed reveal) | Operator |
+| S11 | Conflicted or compromised adjudicator. Rotates: conflicted arbitrator; duplicate vote; operator-forged vote | Mixed |
+| S12 | Receipt with missing or mismatched information. Rotates: missing field; altered commitment; holder backdating; operator-issued backdated receipt | Mixed |
 
-- **P (prevented):** the operation was rejected.
-- **D (detected):** the operation succeeded but verification flags it.
-- **U (undetected):** the operation succeeded and was not flagged.
-
-| ID | Scenario | Attacker capability |
-|----|----------|---------------------|
-| S1 | Unauthorized modification of an existing record | DB admin edits a claim and recomputes that record's own digest/hash |
-| S2 | Consistent history rewrite | DB admin edits a claim and recomputes all later hashes. On the blockchain system the attacker also tries an on-chain fork. |
-| S3 | Deletion of an event record | DB admin deletes a row |
-| S4 | Alteration of an evidence file | File-store write access |
-| S5 | Evidence file and its stored digest replaced | DB and file-store access |
-| S6 | Unauthorized role submits a record | Normal write path, wrong role or not the original author |
-| S7 | Insider forges a record in an authorized party's name | Store operator without that party's key |
-| S8 | Hide or overwrite an unresolved dispute | Store operator: status edit, forged auditor resolution, or deletion |
-| S9 | Reuse of an evidence digest | Byte-identical file submitted for another device |
-| S10 | Conflicting component-replacement claims | Replacement followed by an "original part" assertion |
-| S11 | Correction preserves the earlier claim | Author corrects a claim through the normal path (P = original preserved) |
-
-**Threat-model boundary.** The insider controls the off-chain database and files but **not other parties' private keys**. In the prototype the server holds all demo keys for convenience; the benchmark models the intended deployment, where each party holds its own key. Attacks on the chain node itself (reset, consensus capture) are out of scope for a single local node.
-
-## Hypotheses
-
-- **H1 (RQ1):** For an off-chain insider, the blockchain system detects or prevents ≥ 95% of S1–S8 attempts. The editable store detects < 50% of the content-editing attacks (S1, S2, S5).
-- **H2 (RQ1):** The hardened store with external checkpoints is comparable to the blockchain system on S1–S3 but not on S7 and S8, which need per-party authorization.
-- **H3 (RQ3):** Blockchain insert latency is at least two orders of magnitude higher than SQLite on the same machine, even with instant automining.
-
-These are **descriptive** hypotheses checked against observed counts. No significance tests are run: the attack outcomes are largely deterministic given the mechanism, and the latency results come from one machine.
+Each insider trial on a hardened log is **isolated**: the log and witness are snapshotted and restored, so one trial's damage cannot affect another's audit. On the blockchain design, off-chain edits made in the tamper lab are restored after each trial.
 
 ## Reproducing
 
 ```bash
-npm run benchmark -- --devices 20 --events 10 --seed 42 --trials 20
-npm run benchmark -- --devices 20 --events 10 --seed 7 --trials 20
+npm run benchmark -- --reports 40 --seed 42 --trials 12
 ```
 
-Outputs go to `docs/results/benchmark-seed<S>-<N>x<E>-<timestamp>.{json,md}`, plus `latest.{json,md}`. The JSON records the configuration, Node/Hardhat/solc versions, CPU, workload mix, per-store statistics, per-scenario counts and notes. The Research page in the UI runs the same script, with smaller bounds.
+```bash
+npm run benchmark -- --reports 40 --seed 7 --trials 12
+```
 
-To assess variability, repeat with several seeds and report the range across runs. Run-to-run latency differences on the same seed come from OS scheduling.
+Each run writes `docs/results/benchmark-seed<S>-<N>r-<timestamp>.{json,md}` and `latest.{json,md}`. The Research page in the UI runs the same script, with bounds on its parameters. Twelve trials cover S11's three and S12's four rotating attack types evenly.
 
 ## Threats to validity
 
-- **Single machine, single client, automining.** Real networks add block time and consensus delay, so blockchain latency here is a lower bound.
-- Blockchain verification includes RPC and evidence re-hashing, while the SQLite verifiers run in-process. Verification latencies are not like-for-like.
-- On-chain storage is analytic, not measured from node disk usage, and excludes indexes and receipts.
-- Synthetic workload; the record type mix is assumed, not observed.
-- Scenario outcomes depend on the attacker model chosen. A stronger attacker who holds keys, or a weaker one without admin rights, would change the results. Both the matrix and the notes state the model.
-- The author of the benchmark also built the system (no independent replication).
+- One machine, one sequential client, and a local node that **automines instantly**. Real networks add block and consensus latency, so blockchain latency here is a lower bound.
+- Blockchain receipt verification includes RPC calls; centralised verification is in-process.
+- On-chain storage per submission is computed from the layout, not measured on disk.
+- The synthetic workload's shape (pairs, dispute rate) is assumed.
+- Outcomes depend on the attacker model: an insider holding all keys would defeat the blockchain design too, as the prototype's server-held keys would.
+- The same author built the system and the baselines; there is no independent replication.

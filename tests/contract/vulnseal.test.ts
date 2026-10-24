@@ -74,20 +74,20 @@ describe("VulnSeal contract", () => {
 
     it("records reveal checks append-only: mismatches are counted and kept, a later match is accepted", async () => {
       const a = await anchor(d.ledger, "quillfox", 2);
-      await expectRevert(send("kestrel-triage", "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest)]), "InvalidTransition");
+      await expectRevert(send("kestrel-triage", "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest, a.nonce)]), "InvalidTransition");
       await send("kestrel-triage", "acknowledge", [a.cid]);
       await send("kestrel-triage", "requestReveal", [a.cid]);
-      await expectRevert(send("ashgrove-triage", "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest)]), "WrongProgram");
+      await expectRevert(send("ashgrove-triage", "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest, a.nonce)]), "WrongProgram");
       await expectRevert(send("kestrel-triage", "recordReveal", [a.cid, 9, ZeroHash]), "InvalidOutcome");
-      await send("kestrel-triage", "recordReveal", [a.cid, REVEAL.MISMATCH, revealDigest(a.cid, digest("tampered"))]);
+      await send("kestrel-triage", "recordReveal", [a.cid, REVEAL.MISMATCH, revealDigest(a.cid, digest("tampered"), a.nonce)]);
       let c = await read("getCommitment", a.cid);
       assert.equal(Number(c.status), ST.REVEAL_REQUESTED);
       assert.equal(Number(c.mismatches), 1);
-      await send("kestrel-triage", "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest)]);
+      await send("kestrel-triage", "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest, a.nonce)]);
       c = await read("getCommitment", a.cid);
       assert.equal(Number(c.status), ST.REVEALED);
       assert.equal(Number(c.mismatches), 1, "the earlier mismatch is not erased");
-      await expectRevert(send("kestrel-triage", "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest)]), "InvalidTransition");
+      await expectRevert(send("kestrel-triage", "recordReveal", [a.cid, REVEAL.MATCH, revealDigest(a.cid, a.digest, a.nonce)]), "InvalidTransition");
     });
 
     it("prevents a reviewer from checking their own submission", async () => {
@@ -96,7 +96,7 @@ describe("VulnSeal contract", () => {
       const own = await anchor(d.ledger, "kestrel-triage", 2);
       await send("kestrel-admin", "acknowledge", [own.cid]);
       await send("kestrel-admin", "requestReveal", [own.cid]);
-      await expectRevert(send("kestrel-triage", "recordReveal", [own.cid, REVEAL.MATCH, revealDigest(own.cid, own.digest)]), "SelfReview");
+      await expectRevert(send("kestrel-triage", "recordReveal", [own.cid, REVEAL.MATCH, revealDigest(own.cid, own.digest, own.nonce)]), "SelfReview");
     });
 
     it("preserves the original when a report is revised", async () => {
