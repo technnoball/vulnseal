@@ -1,1220 +1,1208 @@
-// Domain service: builds canonical payloads, commits them to the chain, stores
-// details off-chain, and derives evidence status, conflicts and integrity
-// findings from the combination of both.
-import { randomBytes } from "node:crypto";
-import { canonicalize, payloadDigest } from "./canonical.ts";
-import { Ledger, LedgerError, type OnChainRecord, type WriteResult } from "./chain.ts";
-import { Store, type DeviceRow, type EventRow, type EvidenceRow } from "./db.ts";
+// VulnSeal domain service. Every state change is a contract transaction signed by the
+// acting demo identity; the contract decides whether it is allowed. Confidential
+// material (report text, nonces, evidence, rationales, notes) only exists off-chain,
+// sealed with the vault, and every read of it passes contentAccess().
+import fs from "node:fs";
+import path from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { ZeroHash, getAddress, hexlify, type LogDescription } from "ethers";
+import { LedgerError, type Ledger, type TxResult } from "./chain.ts";
 import {
-  COMPONENTS,
-  EVIDENCE_KINDS,
-  IDENTITIES,
-  OUTCOMES,
-  OUTCOME_LABEL,
-  RECORD_TYPES,
-  RECORD_TYPE_LABEL,
-  REF_TYPES,
-  identityById,
-  isClaimType,
-  typeCode,
-  typeName,
-  type Outcome,
-  type RecordType,
+  REPORT_FIELDS,
+  REPORT_SCHEMA,
+  REVEAL_FORMAT,
+  checkReveal,
+  computeCommitment,
+  fieldsDigest,
+  newNonce,
+  noteDigest,
+  revealDigest,
+  type ReportFields,
+  type RevealCheck,
+  type RevealPackage,
+} from "./commitment.ts";
+import type { Store, Row } from "./db.ts";
+import {
+  ASSOC_STATUS,
+  DECISION_NAMES,
+  DISPUTE_KIND_NAMES,
+  DISPUTE_STATUS,
+  IDENTITY_DEFS,
+  LOG_KINDS,
+  PROGRAMS,
+  REASON_CODES,
+  RELATION_NAMES,
+  REVEAL,
+  REVEAL_NAMES,
+  ROLE,
+  SEVERITIES,
+  ST,
+  STATUS,
+  TRIAGE_TARGETS,
+  identityDef,
+  programDef,
+  reportRef,
+  type IdentityDef,
 } from "./domain.ts";
-import { ALLOWED_MIME, EvidenceVault, MAX_EVIDENCE_BYTES, randomCode, type IntegrityResult } from "./evidence.ts";
-import { computeRecordHash, deviceKeyFor, NO_REF, ZERO_HASH } from "./ledger-hash.ts";
+import type { Keyring } from "./keys.ts";
+import { buildReceipt, verifyReceipt, type Receipt } from "./receipt.ts";
+import type { Vault } from "./vault.ts";
 
 export class ServiceError extends Error {
   status: number;
-  details?: unknown;
-  constructor(message: string, status = 400, details?: unknown) {
+  constructor(message: string, status = 400) {
     super(message);
     this.status = status;
-    this.details = details;
   }
 }
 
-export const CATEGORIES = [
-  "battery",
-  "power",
-  "storage",
-  "memory",
-  "display",
-  "keyboard",
-  "thermal",
-  "board-level",
-  "chassis",
-  "software",
-  "general",
-] as const;
-export const RESULTS = ["pass", "fail", "repaired", "replaced", "partial", "not-repaired", "observed"] as const;
-export const PART_ORIGINS = ["new-oem", "new-compatible", "refurbished", "salvaged", "unknown"] as const;
-export const FORM_FACTORS = ["laptop", "2-in-1", "ultrabook", "workstation", "chromebook"] as const;
-
-export type Category =
-  | "self-reported"
-  | "evidence-attached"
-  | "corroborated"
-  | "disputed"
-  | "superseded"
-  | "evidence-failed"
-  | "dispute-record";
-
-export const CATEGORY_LABEL: Record<Category, string> = {
-  "self-reported": "Self-reported",
-  "evidence-attached": "Evidence attached",
-  corroborated: "Independently corroborated",
-  disputed: "Disputed",
-  superseded: "Corrected / superseded",
-  "evidence-failed": "Evidence integrity failed",
-  "dispute-record": "Dispute record",
-};
-
-export interface EventInput {
-  type: string;
-  claimedAt?: string;
-  category?: string;
-  description?: string;
-  component?: string;
-  result?: string;
-  partOrigin?: string;
-  componentAssertions?: { component: string; state: string }[];
-  measurements?: Record<string, number | string>;
-  fromParty?: string;
-  toParty?: string;
-  evidenceIds?: string[];
-  refSeq?: number;
-  outcome?: string;
-  reason?: string;
-  expectedPrevHash?: string;
+export interface ServiceCtx {
+  store: Store;
+  vault: Vault;
+  ledger: Ledger;
+  keyring: Keyring;
+  evidenceDir: string;
 }
 
-export interface DeviceInput {
-  brand: string;
-  model: string;
-  year?: number;
-  formFactor?: string;
-  synthetic?: boolean;
+export type Viewer = IdentityDef & { address: string };
+
+export const LIMITS = { title: 140, description: 4000, impact: 1500, reproduction: 4000, scope: 300, privateNotes: 2000, note: 2000, rationale: 3000 };
+export const EVIDENCE_MIME = new Set(["application/pdf", "image/png", "image/jpeg", "text/plain", "application/json", "text/csv"]);
+export const MAX_EVIDENCE = 5 * 1024 * 1024;
+
+export interface ChainCommitment {
+  cid: number;
+  commitment: string;
+  researcher: string;
+  programId: number;
+  policyVersion: number;
+  status: number;
+  mismatches: number;
+  anchoredAt: number;
+  supersedes: number;
+  supersededBy: number;
+  logSeq: number;
+  revealDigest: string;
+  family: string;
+}
+export interface ChainAssociation {
+  aid: number;
+  cidA: number;
+  cidB: number;
+  relation: number;
+  status: number;
+  reviewedStatus: number;
+  decidedRelation: number;
+  proposerProgram: number;
+  proposer: string;
+  reviewer: string;
+}
+export interface ChainDispute {
+  did: number;
+  kind: number;
+  status: number;
+  round: number;
+  decision: number;
+  reasonCode: number;
+  firstDecision: number;
+  firstReason: number;
+  reversed: boolean;
+  subject: number;
+  cidA: number;
+  cidB: number;
+  progA: number;
+  progB: number;
+  opener: string;
+  openedAt: number;
+  decidedAt: number;
+  priorityTo: number;
+  policyDigest: string;
 }
 
-// ---------------------------------------------------------------------------
-// validation helpers
-// ---------------------------------------------------------------------------
-function str(v: unknown, name: string, opts: { required?: boolean; max?: number } = {}): string | undefined {
-  if (v === undefined || v === null || v === "") {
-    if (opts.required) throw new ServiceError(`${name} is required`, 422);
-    return undefined;
+interface SealedReport {
+  schema: string;
+  fields: ReportFields;
+  nonce: string;
+  evidenceIds: string[];
+  privateNotes: string;
+  createdAt: string;
+}
+
+const iso = (t: number) => (t ? new Date(t * 1000).toISOString() : null);
+const now = () => new Date().toISOString();
+const salt = () => hexlify(randomBytes(32));
+const sha256 = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
+
+function text(v: unknown, name: string, max: number, required = true): string {
+  if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) {
+    if (required) throw new ServiceError(`${name} is required`, 422);
+    return "";
   }
   if (typeof v !== "string") throw new ServiceError(`${name} must be text`, 422);
   const t = v.trim();
-  if (opts.required && !t) throw new ServiceError(`${name} is required`, 422);
-  if (t.length > (opts.max ?? 2000)) throw new ServiceError(`${name} must be at most ${opts.max ?? 2000} characters`, 422);
-  return t || undefined;
+  if (t.length > max) throw new ServiceError(`${name} must be at most ${max} characters`, 422);
+  return t;
 }
-function oneOf<T extends string>(v: unknown, list: readonly T[], name: string, required = false): T | undefined {
-  if (v === undefined || v === null || v === "") {
-    if (required) throw new ServiceError(`${name} is required`, 422);
-    return undefined;
+function int(v: unknown, name: string): number {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) throw new ServiceError(`${name} must be a whole number`, 422);
+  return n;
+}
+
+export class VulnSealService {
+  readonly ctx: ServiceCtx;
+  constructor(ctx: ServiceCtx) {
+    this.ctx = ctx;
   }
-  if (!list.includes(v as T)) throw new ServiceError(`${name} must be one of: ${list.join(", ")}`, 422);
-  return v as T;
-}
-function isoDate(v: unknown, name: string): string | undefined {
-  const s = str(v, name, { max: 10 });
-  if (!s) return undefined;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(Date.parse(s + "T00:00:00Z"))) throw new ServiceError(`${name} must be a date (YYYY-MM-DD)`, 422);
-  if (Date.parse(s + "T00:00:00Z") > Date.now() + 86_400_000) throw new ServiceError(`${name} cannot be in the future`, 422);
-  return s;
-}
-
-const nowIso = () => new Date().toISOString();
-const nonce = () => randomBytes(16).toString("hex");
-
-export function newPublicId(): string {
-  return `PL-${randomCode(4)}-${randomCode(4)}`;
-}
-
-// ---------------------------------------------------------------------------
-// derived views
-// ---------------------------------------------------------------------------
-export interface EvidenceView {
-  id: string;
-  kind: string;
-  sha256: string;
-  mime: string;
-  size: number;
-  filename: string;
-  description: string;
-  uploadedBy: { id: string; label: string };
-  access: string;
-  committedInSeq: number;
-  committedSha256: string;
-  integrity: IntegrityResult["status"] | "commitment-mismatch" | "unknown-evidence";
-  canViewContent: boolean;
-  reusedElsewhere: { id: string; publicId: string; seq: number | null }[];
-}
-
-export interface EventView {
-  seq: number;
-  type: RecordType;
-  typeLabel: string;
-  payload: Record<string, any>;
-  claimedAt: string | null;
-  recordedAt: string;
-  actor: { id: string; label: string; description: string; address: string };
-  recordHash: string;
-  prevHash: string;
-  payloadDigest: string;
-  txHash: string;
-  blockNumber: number;
-  gasUsed: number;
-  refSeq: number | null;
-  outcome: Outcome;
-  outcomeLabel: string;
-  evidence: EvidenceView[];
-  category: Category;
-  categoryLabel: string;
-  flags: string[];
-  openChallengeSeq: number | null;
-  challenges: { seq: number; resolvedBySeq: number | null; outcome: Outcome | null }[];
-  supersededBySeq: number | null;
-  corroboratedBySeqs: number[];
-  anchor: "anchored" | "digest-mismatch" | "hash-mismatch" | "payload-not-canonical" | "not-on-chain" | "chain-unavailable";
-}
-
-export interface Conflict {
-  component: string;
-  replacedSeq: number;
-  assertedOriginalSeq: number;
-  status: "open" | "addressed";
-  note: string;
-}
-
-export interface Finding {
-  severity: "error" | "warning" | "info";
-  code: string;
-  seq?: number;
-  evidenceId?: string;
-  message: string;
-}
-
-export interface IntegrityReport {
-  publicId: string;
-  deviceKey: string;
-  checkedAt: string;
-  ok: boolean;
-  chain: { contract: string; chainId: number; onChainRecords: number; offChainRecords: number; headHash: string | null; contractVerifyChain: boolean | null };
-  evidenceChecked: number;
-  findings: Finding[];
-}
-
-export class PatchLedgerService {
-  readonly store: Store;
-  readonly ledger: Ledger;
-  readonly vault: EvidenceVault;
-
-  constructor(store: Store, ledger: Ledger, vault: EvidenceVault) {
-    this.store = store;
-    this.ledger = ledger;
-    this.vault = vault;
+  get store() {
+    return this.ctx.store;
+  }
+  get ledger() {
+    return this.ctx.ledger;
   }
 
-  // -- identities ------------------------------------------------------------
-  identityByAddress(address: string) {
-    const a = address.toLowerCase();
-    const id = IDENTITIES.find((i) => this.ledger.addressOf(i.id).toLowerCase() === a);
-    return id
-      ? { id: id.id, label: id.label, description: id.description, address }
-      : { id: "unknown", label: "Unknown account", description: "Address not in the demo identity table", address };
+  // ================================================================ identities
+  viewer(id: string | undefined): Viewer | undefined {
+    const d = identityDef(id);
+    return d ? { ...d, address: this.ctx.keyring.address(d.id) } : undefined;
+  }
+  requireViewer(id: string | undefined): Viewer {
+    const v = this.viewer(id);
+    if (!v) throw new ServiceError("Choose a demo identity first (top right). This is a simulated sign-in, not real authentication.", 401);
+    return v;
+  }
+  identities() {
+    return IDENTITY_DEFS.map((d) => ({
+      ...d,
+      address: this.ctx.keyring.address(d.id),
+      programName: d.programId ? programDef(d.programId)?.name : null,
+    }));
+  }
+  labelOf(address: string) {
+    const id = this.ctx.keyring.idOf(address);
+    const d = identityDef(id);
+    return d ? { id: d.id, label: d.label, kind: d.kind, address } : { id: null, label: `${address.slice(0, 8)}…`, kind: "unknown", address };
+  }
+  privateIdentity(viewer: Viewer) {
+    const row = this.store.get("SELECT sealed FROM identity_private WHERE identity_id = ?", viewer.id);
+    if (!row) return null;
+    this.logAccess(viewer, "read-private-identity", viewer.id, true);
+    return this.ctx.vault.openJson("identity", `identity:${viewer.id}`, row.sealed);
+  }
+  setPrivateIdentity(id: string, data: unknown) {
+    const sealed = this.ctx.vault.sealJson("identity", `identity:${id}`, data);
+    this.store.run("INSERT INTO identity_private(identity_id, sealed) VALUES (?, ?) ON CONFLICT(identity_id) DO UPDATE SET sealed = excluded.sealed", id, sealed);
   }
 
-  async identities() {
-    return Promise.all(
-      IDENTITIES.map(async (i) => {
-        const address = this.ledger.addressOf(i.id);
-        let onChainRoleMask: number | null = null;
-        try {
-          onChainRoleMask = await this.ledger.roleMask(address);
-        } catch {
-          /* chain down: still list identities */
-        }
-        return { ...i, address, onChainRoleMask };
-      }),
+  // ================================================================ chain plumbing
+  async tx(actor: string, method: string, args: unknown[]): Promise<TxResult> {
+    const r = await this.ledger.send(actor, method, args);
+    this.mirrorEvents(r.events, r.hash, r.blockNumber);
+    return r;
+  }
+
+  private mirrorEvents(events: LogDescription[], txHash: string, blockNumber: number) {
+    for (const e of events) {
+      if (e.name !== "LogAppended") continue;
+      this.store.run(
+        `INSERT OR IGNORE INTO chain_events(seq, kind, subject, actor, data_hash, entry_hash, timestamp, tx_hash, block_number)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        Number(e.args.seq),
+        Number(e.args.kind),
+        String(e.args.subject),
+        e.args.actor,
+        e.args.dataHash,
+        e.args.entryHash,
+        Number(e.args.timestamp),
+        txHash,
+        blockNumber,
+      );
+    }
+  }
+
+  /** Read every LogAppended event from the chain (used at startup and by the auditor). */
+  async chainLog() {
+    const c = this.ledger.contract;
+    const logs = await c.queryFilter(c.filters.LogAppended(), 0, "latest");
+    return logs.map((l: any) => ({
+      seq: Number(l.args.seq),
+      kind: Number(l.args.kind),
+      subject: String(l.args.subject),
+      actor: l.args.actor as string,
+      timestamp: Number(l.args.timestamp),
+      dataHash: l.args.dataHash as string,
+      prevHash: l.args.prevHash as string,
+      entryHash: l.args.entryHash as string,
+      txHash: l.transactionHash as string,
+      blockNumber: l.blockNumber as number,
+    }));
+  }
+
+  /** Fill the off-chain log mirror from the chain (inserts only; never overwrites). */
+  async syncLogMirror(): Promise<number> {
+    let n = 0;
+    for (const e of await this.chainLog()) {
+      const r = this.store.run(
+        `INSERT OR IGNORE INTO chain_events(seq, kind, subject, actor, data_hash, entry_hash, timestamp, tx_hash, block_number)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        e.seq, e.kind, e.subject, e.actor, e.dataHash, e.entryHash, e.timestamp, e.txHash, e.blockNumber,
+      );
+      n += Number(r.changes);
+    }
+    return n;
+  }
+
+  async commitmentOnChain(cid: number): Promise<ChainCommitment> {
+    const c = await this.ledger.read("getCommitment", cid);
+    return {
+      cid,
+      commitment: c.commitment,
+      researcher: c.researcher,
+      programId: Number(c.programId),
+      policyVersion: Number(c.policyVersion),
+      status: Number(c.status),
+      mismatches: Number(c.mismatches),
+      anchoredAt: Number(c.anchoredAt),
+      supersedes: Number(c.supersedes),
+      supersededBy: Number(c.supersededBy),
+      logSeq: Number(c.logSeq),
+      revealDigest: c.revealDigest,
+      family: c.family,
+    };
+  }
+
+  async associationOnChain(aid: number): Promise<ChainAssociation> {
+    const s = await this.ledger.read("getAssociation", aid);
+    return {
+      aid,
+      cidA: Number(s.cidA),
+      cidB: Number(s.cidB),
+      relation: Number(s.relation),
+      status: Number(s.status),
+      reviewedStatus: Number(s.reviewedStatus),
+      decidedRelation: Number(s.decidedRelation),
+      proposerProgram: Number(s.proposerProgram),
+      proposer: s.proposer,
+      reviewer: s.reviewer,
+    };
+  }
+
+  async disputeOnChain(did: number): Promise<ChainDispute> {
+    const d = await this.ledger.read("getDispute", did);
+    return {
+      did,
+      kind: Number(d.kind),
+      status: Number(d.status),
+      round: Number(d.round),
+      decision: Number(d.decision),
+      reasonCode: Number(d.reasonCode),
+      firstDecision: Number(d.firstDecision),
+      firstReason: Number(d.firstReason),
+      reversed: Boolean(d.reversed),
+      subject: Number(d.subject),
+      cidA: Number(d.cidA),
+      cidB: Number(d.cidB),
+      progA: Number(d.progA),
+      progB: Number(d.progB),
+      opener: d.opener,
+      openedAt: Number(d.openedAt),
+      decidedAt: Number(d.decidedAt),
+      priorityTo: Number(d.priorityTo),
+      policyDigest: d.policyDigest,
+    };
+  }
+
+  async snapshot() {
+    const [nc, na, nd] = await Promise.all([this.ledger.read("commitmentCount"), this.ledger.read("associationCount"), this.ledger.read("disputeCount")]);
+    const range = (n: bigint) => Array.from({ length: Number(n) }, (_, i) => i + 1);
+    const [commitments, associations, disputes] = await Promise.all([
+      Promise.all(range(nc).map((i) => this.commitmentOnChain(i))),
+      Promise.all(range(na).map((i) => this.associationOnChain(i))),
+      Promise.all(range(nd).map((i) => this.disputeOnChain(i))),
+    ]);
+    return { commitments, associations, disputes };
+  }
+
+  private report(cid: number): Row {
+    const r = this.store.get("SELECT * FROM reports WHERE cid = ?", cid);
+    if (!r) throw new ServiceError(`No report ${reportRef(cid)} in the off-chain store`, 404);
+    return r;
+  }
+  private openReport(r: Row): SealedReport {
+    return this.ctx.vault.openJson<SealedReport>("report", `report:${r.cid}`, r.sealed);
+  }
+  private async refreshReport(cid: number) {
+    const c = await this.commitmentOnChain(cid);
+    this.store.run(
+      "UPDATE reports SET status = ?, mismatches = ?, reveal_digest = ?, superseded_by = ? WHERE cid = ?",
+      c.status,
+      c.mismatches,
+      c.revealDigest === ZeroHash ? null : c.revealDigest,
+      c.supersededBy || null,
+      cid,
     );
+    return c;
   }
 
-  private requireActor(actorId: string | undefined): string {
-    if (!actorId || !identityById(actorId)) throw new ServiceError("Select a demonstration identity first (X-Demo-Actor header missing or unknown).", 401);
-    return actorId;
+  // ================================================================ access policy
+  logAccess(viewer: Viewer | undefined, action: string, object: string, allowed: boolean) {
+    this.store.run("INSERT INTO access_log(at, identity_id, action, object, allowed) VALUES (?, ?, ?, ?, ?)", now(), viewer?.id ?? "anonymous", action, object, allowed ? 1 : 0);
   }
 
-  private requireDevice(publicId: string): DeviceRow {
-    const d = this.store.getDevice(publicId);
-    if (!d) throw new ServiceError(`Device ${publicId} not found`, 404);
+  /** Who may read a report's confidential content, and which version (vault original or revealed copy). */
+  async contentAccess(viewer: Viewer | undefined, cid: number): Promise<{ allowed: boolean; scope: "owner" | "program" | "disclosed" | "arbitrator" | "none"; reason: string }> {
+    const r = this.report(cid);
+    if (!viewer) return { allowed: false, scope: "none", reason: "No identity selected." };
+    if (viewer.id === r.researcher_id) return { allowed: true, scope: "owner", reason: "You committed this report." };
+    const revealed = this.store.get("SELECT id FROM reveals WHERE cid = ? LIMIT 1", cid);
+    const staff = viewer.kind === "program-admin" || viewer.kind === "reviewer";
+    if (staff && viewer.programId === r.program_id) {
+      return revealed
+        ? { allowed: true, scope: "program", reason: "Your program received this report and the researcher has revealed it." }
+        : { allowed: false, scope: "none", reason: "The researcher has not revealed this report to your program yet; only its commitment is visible." };
+    }
+    if (staff && revealed && (await this.ledger.read<boolean>("disclosedTo", cid, viewer.programId))) {
+      return { allowed: true, scope: "disclosed", reason: "Disclosure to your program was granted on-chain." };
+    }
+    if (viewer.kind === "arbitrator" && revealed) {
+      const { disputes } = await this.disputesFor(cid);
+      const conflicted = (d: ChainDispute) => viewer.programId !== 0 && (viewer.programId === d.progA || viewer.programId === d.progB);
+      if (disputes.some((d) => d.status !== 4 && !conflicted(d))) {
+        return { allowed: true, scope: "arbitrator", reason: "You are eligible to arbitrate an active dispute that involves this report." };
+      }
+      return { allowed: false, scope: "none", reason: "Arbitrators only see report content while an active dispute involving it is before them (and never when conflicted)." };
+    }
+    if (viewer.kind === "auditor") return { allowed: false, scope: "none", reason: "Auditors see commitments, digests and decisions, not report content." };
+    return { allowed: false, scope: "none", reason: "You are not authorized to read this report's confidential content." };
+  }
+
+  private async disputesFor(cid: number) {
+    const rows = this.store.all("SELECT did FROM disputes WHERE cid_a = ? OR cid_b = ?", cid, cid);
+    return { disputes: await Promise.all(rows.map((r) => this.disputeOnChain(r.did))) };
+  }
+
+  // ================================================================ evidence
+  uploadEvidence(viewer: Viewer, file: { buffer: Uint8Array; originalname: string; mimetype: string } | undefined) {
+    if (viewer.kind !== "researcher") throw new ServiceError("Only researchers attach evidence to their own reports.", 403);
+    if (!file) throw new ServiceError("No file was uploaded", 422);
+    if (!EVIDENCE_MIME.has(file.mimetype)) throw new ServiceError(`File type ${file.mimetype} is not accepted (PDF, PNG, JPEG, text, CSV or JSON)`, 415);
+    if (!file.buffer.byteLength) throw new ServiceError("The file is empty", 422);
+    if (file.buffer.byteLength > MAX_EVIDENCE) throw new ServiceError("Evidence files are limited to 5 MB", 413);
+    const id = `EV-${randomBytes(6).toString("hex").toUpperCase()}`;
+    const stored = `${randomBytes(16).toString("hex")}.sealed`;
+    fs.mkdirSync(this.ctx.evidenceDir, { recursive: true });
+    fs.writeFileSync(path.join(this.ctx.evidenceDir, stored), this.ctx.vault.seal("evidence", `evidence:${id}`, file.buffer), { flag: "wx" });
+    const name = (file.originalname || "evidence").replace(/[^\w.\- ]+/g, "_").slice(0, 120);
+    const digest = sha256(file.buffer);
+    this.store.run(
+      "INSERT INTO evidence(id, owner_id, cid, sha256, size, mime, sealed_name, stored_name, created_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+      id,
+      viewer.id,
+      digest,
+      file.buffer.byteLength,
+      file.mimetype,
+      this.ctx.vault.seal("evidence", `evidence-name:${id}`, Buffer.from(name)),
+      stored,
+      now(),
+    );
+    return { id, sha256: digest, size: file.buffer.byteLength, mime: file.mimetype, filename: name };
+  }
+
+  pendingEvidence(viewer: Viewer) {
+    return this.store.all("SELECT * FROM evidence WHERE owner_id = ? AND cid IS NULL ORDER BY created_at", viewer.id).map((e) => this.evidenceMeta(e, true));
+  }
+
+  private evidenceMeta(e: Row, withName: boolean) {
+    return {
+      id: e.id,
+      sha256: e.sha256,
+      size: e.size,
+      mime: e.mime,
+      cid: e.cid,
+      filename: withName ? this.ctx.vault.open("evidence", `evidence-name:${e.id}`, e.sealed_name).toString("utf8") : null,
+    };
+  }
+
+  async evidenceFile(viewer: Viewer, id: string) {
+    const e = this.store.get("SELECT * FROM evidence WHERE id = ?", id);
+    if (!e) throw new ServiceError("Evidence not found", 404);
+    const allowed = e.cid === null ? e.owner_id === viewer.id : (await this.contentAccess(viewer, e.cid)).allowed;
+    this.logAccess(viewer, "read-evidence", id, allowed);
+    if (!allowed) throw new ServiceError("You are not authorized to open this evidence file.", 403);
+    const plain = this.ctx.vault.open("evidence", `evidence:${id}`, fs.readFileSync(path.join(this.ctx.evidenceDir, e.stored_name)));
+    return { data: plain, mime: e.mime, filename: this.evidenceMeta(e, true).filename, sha256Matches: sha256(plain) === e.sha256 };
+  }
+
+  // ================================================================ researcher
+  private reportFields(input: Record<string, unknown>, evidence: string[]): ReportFields {
+    const severity = String(input.severity ?? "");
+    if (!(SEVERITIES as readonly string[]).includes(severity)) throw new ServiceError(`Severity must be one of ${SEVERITIES.join(", ")}`, 422);
+    return {
+      title: text(input.title, "Title", LIMITS.title),
+      description: text(input.description, "Description", LIMITS.description),
+      impact: text(input.impact, "Impact", LIMITS.impact),
+      reproduction: text(input.reproduction, "Reproduction notes", LIMITS.reproduction),
+      scope: text(input.scope, "Scope", LIMITS.scope),
+      severity,
+      evidence,
+    };
+  }
+
+  /** Create a report, commit to it on-chain and seal it in the researcher's vault. */
+  async commitReport(viewer: Viewer, input: Record<string, unknown>, supersedes?: number) {
+    const programId = int(input.programId, "Program");
+    if (!programDef(programId)) throw new ServiceError("Unknown program", 422);
+    const evidenceIds = Array.isArray(input.evidenceIds) ? [...new Set(input.evidenceIds.map(String))] : [];
+    if (evidenceIds.length > 10) throw new ServiceError("At most 10 evidence files per report", 422);
+    const ev = evidenceIds.map((id) => {
+      const e = this.store.get("SELECT * FROM evidence WHERE id = ?", id);
+      if (!e || e.owner_id !== viewer.id) throw new ServiceError(`Evidence ${id} is not one of your uploads`, 403);
+      if (e.cid !== null) throw new ServiceError(`Evidence ${id} is already committed in ${reportRef(e.cid)}`, 409);
+      return e;
+    });
+    const fields = this.reportFields(input, ev.map((e) => e.sha256));
+    const privateNotes = text(input.privateNotes, "Private notes", LIMITS.privateNotes, false);
+    const program = await this.ledger.read("programs", programId);
+    const policyVersion = Number(program.policyVersion);
+    const nonce = newNonce();
+    const digest = fieldsDigest(fields);
+    const commitment = computeCommitment(
+      { chainId: this.ledger.chainId, contract: this.ledger.address, researcher: viewer.address, programId, policyVersion },
+      digest,
+      nonce,
+    );
+    const tx = supersedes
+      ? await this.tx(viewer.id, "reviseCommitment", [supersedes, commitment, policyVersion])
+      : await this.tx(viewer.id, "anchorCommitment", [commitment, programId, policyVersion]);
+    const anchored = tx.events.find((e) => e.name === "CommitmentAnchored")!;
+    const cid = Number(anchored.args.cid);
+    const onchain = await this.commitmentOnChain(cid);
+    const sealed: SealedReport = { schema: REPORT_SCHEMA, fields, nonce, evidenceIds, privateNotes, createdAt: now() };
+    this.store.tx(() => {
+      this.store.run(
+        `INSERT INTO reports(cid, researcher_id, researcher_address, program_id, policy_version, commitment, supersedes, superseded_by,
+           status, mismatches, reveal_digest, anchored_at, log_seq, tx_hash, block_number, gas_used, sealed, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?)`,
+        cid,
+        viewer.id,
+        viewer.address,
+        programId,
+        policyVersion,
+        commitment,
+        supersedes ?? null,
+        onchain.status,
+        onchain.anchoredAt,
+        onchain.logSeq,
+        tx.hash,
+        tx.blockNumber,
+        tx.gasUsed,
+        this.ctx.vault.sealJson("report", `report:${cid}`, sealed),
+        now(),
+      );
+      for (const e of ev) this.store.run("UPDATE evidence SET cid = ? WHERE id = ?", cid, e.id);
+      if (supersedes) this.store.run("UPDATE reports SET superseded_by = ? WHERE cid = ?", cid, supersedes);
+    });
+    return { cid, ref: reportRef(cid), commitment, policyVersion, tx: { hash: tx.hash, blockNumber: tx.blockNumber, gasUsed: tx.gasUsed }, receipt: await this.receipt(viewer, cid) };
+  }
+
+  async reviseReport(viewer: Viewer, cid: number, input: Record<string, unknown>) {
+    const r = this.report(cid);
+    if (r.researcher_id !== viewer.id) throw new ServiceError("Only the researcher who committed this report can revise it.", 403);
+    return this.commitReport(viewer, { ...input, programId: r.program_id }, cid);
+  }
+
+  async receipt(viewer: Viewer, cid: number): Promise<Receipt> {
+    const r = this.report(cid);
+    const staff = (viewer.kind === "program-admin" || viewer.kind === "reviewer") && viewer.programId === r.program_id;
+    if (viewer.id !== r.researcher_id && !staff && viewer.kind !== "auditor") {
+      throw new ServiceError("Receipts are issued to the researcher, the receiving program and auditors.", 403);
+    }
+    const c = await this.commitmentOnChain(cid);
+    const block = await this.ledger.provider.getBlock(r.block_number);
+    const program = await this.ledger.read("programs", c.programId);
+    return buildReceipt({
+      reportRef: reportRef(cid),
+      commitmentId: cid,
+      commitment: c.commitment,
+      researcher: getAddress(c.researcher),
+      programId: c.programId,
+      programNameTag: program.nameTag,
+      policyVersion: c.policyVersion,
+      policyDigest: await this.ledger.read("policyDigest", c.programId, c.policyVersion),
+      chainId: this.ledger.chainId,
+      contract: this.ledger.address,
+      txHash: r.tx_hash,
+      blockNumber: r.block_number,
+      blockHash: block?.hash ?? "",
+      anchoredAt: c.anchoredAt,
+      logSeq: c.logSeq,
+      logEntryHash: await this.ledger.read("logEntries", c.logSeq),
+      supersedes: c.supersedes,
+    });
+  }
+
+  /** The researcher's private reveal material. Whoever holds it can reveal the report. */
+  async recoveryPackage(viewer: Viewer, cid: number): Promise<RevealPackage & { receipt: Receipt; warning: string }> {
+    const r = this.report(cid);
+    if (r.researcher_id !== viewer.id) {
+      this.logAccess(viewer, "read-recovery-package", reportRef(cid), false);
+      throw new ServiceError("Only the researcher who committed this report can download its recovery package.", 403);
+    }
+    this.logAccess(viewer, "read-recovery-package", reportRef(cid), true);
+    const s = this.openReport(r);
+    return {
+      format: REVEAL_FORMAT,
+      warning: "PRIVATE. Contains the secret nonce and the full report. Anyone holding this file can reveal the report. If the nonce is lost the commitment can never be opened.",
+      commitmentId: cid,
+      chainId: this.ledger.chainId,
+      contract: this.ledger.address,
+      researcher: r.researcher_address,
+      programId: r.program_id,
+      policyVersion: r.policy_version,
+      report: { schema: REPORT_SCHEMA, ...s.fields },
+      nonce: s.nonce,
+      receipt: await this.receipt(viewer, cid),
+    };
+  }
+
+  private anchoredCtx(r: Row, c: ChainCommitment) {
+    return { cid: c.cid, commitment: c.commitment, chainId: this.ledger.chainId, contract: this.ledger.address, researcher: c.researcher, programId: c.programId, policyVersion: c.policyVersion };
+  }
+
+  /** Check a reveal locally and with the contract's verifyOpening (an eth_call, not a transaction). */
+  async checkPackage(r: Row, pkg: unknown): Promise<RevealCheck & { contractAgrees: boolean | null }> {
+    const c = await this.commitmentOnChain(r.cid);
+    const check = checkReveal(pkg, this.anchoredCtx(r, c));
+    let contractAgrees: boolean | null = null;
+    if (check.outcome === "match" || check.outcome === "mismatch") {
+      const ok = await this.ledger.read<boolean>("verifyOpening", r.cid, check.fieldsDigest, (pkg as RevealPackage).nonce);
+      contractAgrees = ok === (check.outcome === "match");
+    }
+    return { ...check, contractAgrees };
+  }
+
+  /**
+   * Researcher reveals to the receiving program. mode "vault" uses the sealed original;
+   * "package" takes an uploaded recovery package; "edited" applies field edits to the
+   * original (to demonstrate that altered content is detected).
+   */
+  async submitReveal(viewer: Viewer, cid: number, body: Record<string, any>) {
+    const r = this.report(cid);
+    if (r.researcher_id !== viewer.id) throw new ServiceError(`Only the researcher who committed ${reportRef(cid)} can reveal it.`, 403);
+    const c = await this.commitmentOnChain(cid);
+    if (c.supersededBy) throw new ServiceError(`${reportRef(cid)} was replaced by ${reportRef(c.supersededBy)}; reveal the newer report.`, 409);
+    if (c.status !== ST.REVEAL_REQUESTED) {
+      throw new ServiceError(
+        c.status < ST.REVEAL_REQUESTED
+          ? "The program has not requested a reveal yet. Revealing early would disclose the report before the agreed process allows it."
+          : "This report has already been revealed and verified.",
+        409,
+      );
+    }
+    const mode = String(body.mode ?? "vault");
+    let pkg: any;
+    const s = this.openReport(r);
+    const base = {
+      format: REVEAL_FORMAT,
+      commitmentId: cid,
+      chainId: this.ledger.chainId,
+      contract: this.ledger.address,
+      researcher: r.researcher_address,
+      programId: r.program_id,
+      policyVersion: r.policy_version,
+      report: { schema: REPORT_SCHEMA, ...s.fields },
+      nonce: s.nonce,
+    };
+    if (mode === "vault") pkg = base;
+    else if (mode === "edited") {
+      const edits = (body.edits ?? {}) as Record<string, unknown>;
+      const report: Record<string, unknown> = { ...base.report };
+      for (const f of REPORT_FIELDS) if (typeof edits[f] === "string") report[f] = edits[f];
+      pkg = { ...base, report };
+    } else if (mode === "package") {
+      pkg = body.package;
+      if (typeof pkg === "string") {
+        try {
+          pkg = JSON.parse(pkg);
+        } catch {
+          pkg = null;
+        }
+      }
+    } else throw new ServiceError("mode must be vault, edited or package", 422);
+    const check = await this.checkPackage(r, pkg);
+    const res = this.store.run(
+      "INSERT INTO reveals(cid, submitted_by, submitted_at, source, precheck, sealed) VALUES (?, ?, ?, ?, ?, ?)",
+      cid,
+      viewer.id,
+      now(),
+      mode,
+      check.outcome,
+      Buffer.alloc(0),
+    );
+    const id = Number(res.lastInsertRowid);
+    this.store.run("UPDATE reveals SET sealed = ? WHERE id = ?", this.ctx.vault.sealJson("reveal", `reveal:${id}`, pkg ?? null), id);
+    return { revealId: id, precheck: check, note: "Disclosed to the receiving program's staff, who verify it and record the result on-chain." };
+  }
+
+  // ================================================================ program
+  private requireStaffOf(viewer: Viewer, programId: number) {
+    if ((viewer.kind !== "program-admin" && viewer.kind !== "reviewer") || viewer.programId !== programId) {
+      throw new ServiceError("Only staff of the receiving program can do this.", 403);
+    }
+  }
+
+  async acknowledge(viewer: Viewer, cid: number) {
+    this.report(cid);
+    const tx = await this.tx(viewer.id, "acknowledge", [cid]);
+    await this.refreshReport(cid);
+    return { tx: tx.hash };
+  }
+
+  async requestReveal(viewer: Viewer, cid: number) {
+    this.report(cid);
+    const tx = await this.tx(viewer.id, "requestReveal", [cid]);
+    await this.refreshReport(cid);
+    return { tx: tx.hash };
+  }
+
+  /** Program reviewer re-checks a submitted reveal and records the outcome on-chain. */
+  async verifyReveal(viewer: Viewer, revealId: number) {
+    const rv = this.store.get("SELECT * FROM reveals WHERE id = ?", revealId);
+    if (!rv) throw new ServiceError("Reveal not found", 404);
+    const r = this.report(rv.cid);
+    this.requireStaffOf(viewer, r.program_id);
+    const pkg = this.ctx.vault.openJson("reveal", `reveal:${revealId}`, rv.sealed);
+    const check = await this.checkPackage(r, pkg);
+    const code = { match: REVEAL.MATCH, mismatch: REVEAL.MISMATCH, missing: REVEAL.MISSING, "invalid-encoding": REVEAL.BAD_ENCODING }[check.outcome];
+    const digest = check.outcome === "match" || check.outcome === "mismatch" ? check.revealDigest : ZeroHash;
+    const tx = await this.tx(viewer.id, "recordReveal", [r.cid, code, digest]);
+    this.store.run("UPDATE reveals SET verified_by = ?, verified_at = ?, outcome = ?, reveal_digest = ?, tx_hash = ? WHERE id = ?", viewer.id, now(), check.outcome, digest, tx.hash, revealId);
+    await this.refreshReport(r.cid);
+    return { outcome: check.outcome, check, tx: tx.hash };
+  }
+
+  async triage(viewer: Viewer, cid: number, target: string, note: string) {
+    this.report(cid);
+    const to = TRIAGE_TARGETS[target as keyof typeof TRIAGE_TARGETS];
+    if (!to) throw new ServiceError(`Triage target must be one of ${Object.keys(TRIAGE_TARGETS).join(", ")}`, 422);
+    const n = text(note, "Triage note", LIMITS.note, false);
+    const s = salt();
+    const tx = await this.tx(viewer.id, "setTriage", [cid, to, n ? noteDigest(n, s) : ZeroHash]);
+    if (n) this.addNoteRow(viewer, cid, `[triage → ${STATUS[to]}] ${n}`);
+    await this.refreshReport(cid);
+    return { tx: tx.hash, status: STATUS[to] };
+  }
+
+  private addNoteRow(viewer: Viewer, cid: number, body: string) {
+    const r = this.report(cid);
+    const res = this.store.run("INSERT INTO notes(cid, program_id, author_id, sealed, created_at) VALUES (?, ?, ?, ?, ?)", cid, r.program_id, viewer.id, Buffer.alloc(0), now());
+    const id = Number(res.lastInsertRowid);
+    this.store.run("UPDATE notes SET sealed = ? WHERE id = ?", this.ctx.vault.seal("note", `note:${id}`, Buffer.from(body)), id);
+    return id;
+  }
+
+  addNote(viewer: Viewer, cid: number, body: string) {
+    const r = this.report(cid);
+    this.requireStaffOf(viewer, r.program_id);
+    return { id: this.addNoteRow(viewer, cid, text(body, "Note", LIMITS.note)) };
+  }
+
+  async grantDisclosure(viewer: Viewer, cid: number, toProgram: number) {
+    this.report(cid);
+    const tx = await this.tx(viewer.id, "grantDisclosure", [cid, toProgram]);
+    this.store.run("INSERT OR IGNORE INTO grants(cid, to_program, granted_by, tx_hash, created_at) VALUES (?, ?, ?, ?, ?)", cid, toProgram, viewer.id, tx.hash, now());
+    return { tx: tx.hash };
+  }
+
+  async finalizeReport(viewer: Viewer, cid: number, note: string) {
+    this.report(cid);
+    const n = text(note, "Disposition note", LIMITS.note);
+    const tx = await this.tx(viewer.id, "finalizeReport", [cid, noteDigest(n, salt())]);
+    this.addNoteRow(viewer, cid, `[final disposition] ${n}`);
+    await this.refreshReport(cid);
+    return { tx: tx.hash };
+  }
+
+  async programInbox(viewer: Viewer) {
+    if (viewer.kind !== "program-admin" && viewer.kind !== "reviewer") throw new ServiceError("The program workspace is for program staff.", 403);
+    const rows = this.store.all("SELECT * FROM reports WHERE program_id = ? ORDER BY cid DESC", viewer.programId);
+    const items = [];
+    for (const r of rows) {
+      const c = await this.commitmentOnChain(r.cid);
+      const reveals = this.store.all("SELECT id, submitted_at, source, precheck, outcome, verified_by, tx_hash FROM reveals WHERE cid = ? ORDER BY id", r.cid);
+      const access = await this.contentAccess(viewer, r.cid);
+      const title = access.allowed ? this.revealedFields(r)?.title ?? null : null;
+      items.push({
+        cid: r.cid,
+        ref: reportRef(r.cid),
+        researcher: this.labelOf(r.researcher_address),
+        status: c.status,
+        statusName: STATUS[c.status],
+        anchoredAt: iso(c.anchoredAt),
+        mismatches: c.mismatches,
+        supersededBy: c.supersededBy || null,
+        supersedes: c.supersedes || null,
+        title,
+        reveals,
+        pendingVerification: reveals.filter((x) => !x.outcome).map((x) => x.id),
+      });
+    }
+    // other programs' reports disclosed to this program
+    const disclosed = this.store.all("SELECT g.cid FROM grants g WHERE g.to_program = ?", viewer.programId).map((g) => g.cid);
+    return { programId: viewer.programId, program: programDef(viewer.programId), items, disclosed };
+  }
+
+  /** Latest revealed fields (prefer the verified match), as seen by a program. */
+  private revealedFields(r: Row): (ReportFields & { revealId: number; precheck: string; outcome: string | null }) | null {
+    const rv =
+      this.store.get("SELECT * FROM reveals WHERE cid = ? AND outcome = 'match' ORDER BY id DESC LIMIT 1", r.cid) ??
+      this.store.get("SELECT * FROM reveals WHERE cid = ? ORDER BY id DESC LIMIT 1", r.cid);
+    if (!rv) return null;
+    const pkg = this.ctx.vault.openJson<any>("reveal", `reveal:${rv.id}`, rv.sealed);
+    const rep = pkg?.report ?? {};
+    return {
+      title: String(rep.title ?? ""),
+      description: String(rep.description ?? ""),
+      impact: String(rep.impact ?? ""),
+      reproduction: String(rep.reproduction ?? ""),
+      scope: String(rep.scope ?? ""),
+      severity: String(rep.severity ?? ""),
+      evidence: Array.isArray(rep.evidence) ? rep.evidence : [],
+      revealId: rv.id,
+      precheck: rv.precheck,
+      outcome: rv.outcome,
+    };
+  }
+
+  // ================================================================ report view
+  async reportView(viewer: Viewer, cid: number) {
+    const r = this.report(cid);
+    const c = await this.commitmentOnChain(cid);
+    const access = await this.contentAccess(viewer, cid);
+    this.logAccess(viewer, "read-report", reportRef(cid), access.allowed);
+    const isOwner = viewer.id === r.researcher_id;
+    const staff = (viewer.kind === "program-admin" || viewer.kind === "reviewer") && viewer.programId === r.program_id;
+    let content: any = null;
+    if (access.allowed) {
+      if (access.scope === "owner") {
+        const s = this.openReport(r);
+        content = { source: "your sealed original", ...s.fields, privateNotes: s.privateNotes };
+      } else {
+        const f = this.revealedFields(r)!;
+        content = { source: `revealed copy (reveal #${f.revealId}, ${f.outcome ?? `pre-check ${f.precheck}, not yet verified`})`, ...f };
+      }
+      const ev = this.store.all("SELECT * FROM evidence WHERE cid = ?", cid);
+      content.evidenceFiles = ev.map((e) => ({ ...this.evidenceMeta(e, true), committed: (content.evidence as string[]).includes(e.sha256) }));
+    }
+    const reveals =
+      isOwner || staff || viewer.kind === "auditor"
+        ? this.store.all("SELECT id, submitted_by, submitted_at, source, precheck, verified_by, verified_at, outcome, reveal_digest, tx_hash FROM reveals WHERE cid = ? ORDER BY id", cid)
+        : [];
+    const notes = staff
+      ? this.store.all("SELECT * FROM notes WHERE cid = ? ORDER BY id", cid).map((n) => ({
+          id: n.id,
+          author: identityDef(n.author_id)?.label ?? n.author_id,
+          createdAt: n.created_at,
+          body: this.ctx.vault.open("note", `note:${n.id}`, n.sealed).toString("utf8"),
+        }))
+      : [];
+    const assocs = this.store.all("SELECT aid FROM associations WHERE cid_a = ? OR cid_b = ?", cid, cid);
+    const { disputes } = await this.disputesFor(cid);
+    const grants = this.store.all("SELECT to_program, granted_by, tx_hash, created_at FROM grants WHERE cid = ?", cid);
+    return {
+      cid,
+      ref: reportRef(cid),
+      program: programDef(c.programId),
+      researcher: this.labelOf(c.researcher),
+      commitment: c.commitment,
+      policyVersion: c.policyVersion,
+      status: c.status,
+      statusName: STATUS[c.status],
+      mismatches: c.mismatches,
+      revealDigest: c.revealDigest === ZeroHash ? null : c.revealDigest,
+      family: c.family === ZeroHash ? null : c.family,
+      anchoredAt: iso(c.anchoredAt),
+      supersedes: c.supersedes || null,
+      supersededBy: c.supersededBy || null,
+      tx: { hash: r.tx_hash, blockNumber: r.block_number, gasUsed: r.gas_used },
+      logSeq: c.logSeq,
+      isOwner,
+      isStaff: staff,
+      access,
+      content,
+      reveals,
+      notes,
+      grants,
+      associations: await Promise.all(assocs.map((a) => this.associationView(viewer, a.aid))),
+      disputes: disputes.map((d) => this.disputeSummary(d)),
+      timeline: this.timelineFor(cid),
+    };
+  }
+
+  /** Log entries about a report: its own transitions plus association and dispute events. */
+  timelineFor(cid: number) {
+    const aids = this.store.all("SELECT aid FROM associations WHERE cid_a = ? OR cid_b = ?", cid, cid).map((r) => String(r.aid));
+    const dids = this.store.all("SELECT did FROM disputes WHERE cid_a = ? OR cid_b = ?", cid, cid).map((r) => String(r.did));
+    const rows = this.store.all("SELECT * FROM chain_events ORDER BY seq");
+    return rows
+      .filter(
+        (e) =>
+          ([4, 5, 6, 7, 8, 9, 10, 19].includes(e.kind) && e.subject === String(cid)) ||
+          ([11, 12].includes(e.kind) && aids.includes(e.subject)) ||
+          ([13, 14, 15, 16, 17, 18].includes(e.kind) && dids.includes(e.subject)),
+      )
+      .map((e) => this.eventView(e));
+  }
+
+  eventView(e: Row) {
+    return {
+      seq: e.seq,
+      kind: e.kind,
+      kindName: LOG_KINDS[e.kind] ?? `kind ${e.kind}`,
+      subject: e.subject,
+      actor: this.labelOf(e.actor),
+      at: iso(e.timestamp),
+      dataHash: e.data_hash,
+      entryHash: e.entry_hash,
+      txHash: e.tx_hash,
+      blockNumber: e.block_number,
+    };
+  }
+
+  async myReports(viewer: Viewer) {
+    if (viewer.kind !== "researcher") throw new ServiceError("The researcher workspace is for researcher identities.", 403);
+    const rows = this.store.all("SELECT * FROM reports WHERE researcher_id = ? ORDER BY cid DESC", viewer.id);
+    const out = [];
+    for (const r of rows) {
+      const c = await this.commitmentOnChain(r.cid);
+      const s = this.openReport(r);
+      out.push({
+        cid: r.cid,
+        ref: reportRef(r.cid),
+        title: s.fields.title,
+        program: programDef(c.programId),
+        status: c.status,
+        statusName: STATUS[c.status],
+        anchoredAt: iso(c.anchoredAt),
+        mismatches: c.mismatches,
+        supersededBy: c.supersededBy || null,
+        supersedes: c.supersedes || null,
+        family: c.family === ZeroHash ? null : c.family,
+      });
+    }
+    return { reports: out, pendingEvidence: this.pendingEvidence(viewer), privateIdentity: this.privateIdentity(viewer) };
+  }
+
+  // ================================================================ associations
+  async proposeAssociation(viewer: Viewer, cidA: number, cidB: number, relation: number, rationale: string) {
+    this.report(cidA);
+    this.report(cidB);
+    const why = text(rationale, "Rationale", LIMITS.rationale);
+    const s = salt();
+    const digest = noteDigest(why, s);
+    const tx = await this.tx(viewer.id, "proposeAssociation", [cidA, cidB, relation, digest]);
+    const aid = Number(tx.events.find((e) => e.name === "AssociationProposed")!.args.aid);
+    this.store.run(
+      "INSERT INTO associations(aid, cid_a, cid_b, relation, status, proposer_id, family, salt, digest, sealed, tx_hash, created_at) VALUES (?, ?, ?, ?, 1, ?, NULL, ?, ?, ?, ?, ?)",
+      aid, cidA, cidB, relation, viewer.id, s, digest, this.ctx.vault.seal("rationale", `assoc:${aid}`, Buffer.from(why)), tx.hash, now(),
+    );
+    return { aid, tx: tx.hash };
+  }
+
+  async reviewAssociation(viewer: Viewer, aid: number, approve: boolean, rationale: string) {
+    if (!this.store.get("SELECT aid FROM associations WHERE aid = ?", aid)) throw new ServiceError("Association not found", 404);
+    const why = text(rationale, "Review rationale", LIMITS.rationale);
+    const s = salt();
+    const digest = noteDigest(why, s);
+    const tx = await this.tx(viewer.id, "reviewAssociation", [aid, approve, digest]);
+    const res = this.store.run(
+      "INSERT INTO association_reviews(aid, reviewer_id, approve, salt, digest, sealed, tx_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      aid, viewer.id, approve ? 1 : 0, s, digest, Buffer.alloc(0), tx.hash, now(),
+    );
+    const id = Number(res.lastInsertRowid);
+    this.store.run("UPDATE association_reviews SET sealed = ? WHERE id = ?", this.ctx.vault.seal("rationale", `assoc-review:${id}`, Buffer.from(why)), id);
+    await this.refreshAssociation(aid);
+    return { tx: tx.hash };
+  }
+
+  private async refreshAssociation(aid: number) {
+    const s = await this.associationOnChain(aid);
+    const fam = (await this.commitmentOnChain(s.cidA)).family;
+    this.store.run("UPDATE associations SET status = ?, family = ? WHERE aid = ?", s.status, fam === ZeroHash ? null : fam, aid);
+    return s;
+  }
+
+  /** Rationales are visible to staff of both programs and to unconflicted arbitrators. */
+  private canReadRationale(viewer: Viewer, progs: number[]) {
+    if ((viewer.kind === "program-admin" || viewer.kind === "reviewer") && progs.includes(viewer.programId)) return true;
+    if (viewer.kind === "arbitrator") return viewer.programId === 0 || !progs.includes(viewer.programId);
+    return false;
+  }
+
+  async associationView(viewer: Viewer, aid: number) {
+    const s = await this.associationOnChain(aid);
+    const row = this.store.get("SELECT * FROM associations WHERE aid = ?", aid);
+    const [a, b] = await Promise.all([this.commitmentOnChain(s.cidA), this.commitmentOnChain(s.cidB)]);
+    const progs = [a.programId, b.programId];
+    const readable = row && this.canReadRationale(viewer, progs);
+    const effective = Number(await this.ledger.read("effectiveRelation", aid));
+    return {
+      aid,
+      cidA: s.cidA,
+      cidB: s.cidB,
+      refA: reportRef(s.cidA),
+      refB: reportRef(s.cidB),
+      programs: progs.map((p) => programDef(p)?.short),
+      relation: s.relation,
+      relationName: RELATION_NAMES[s.relation],
+      effectiveRelation: effective,
+      effectiveRelationName: effective ? RELATION_NAMES[effective] : "none",
+      status: s.status,
+      statusName: ASSOC_STATUS[s.status],
+      decidedRelation: s.decidedRelation,
+      family: a.family !== ZeroHash && a.family === b.family ? a.family : null,
+      proposer: this.labelOf(s.proposer),
+      reviewer: s.reviewer === "0x0000000000000000000000000000000000000000" ? null : this.labelOf(s.reviewer),
+      rationaleDigest: row?.digest ?? null,
+      rationale: readable ? this.ctx.vault.open("rationale", `assoc:${aid}`, row!.sealed).toString("utf8") : null,
+      reviews: this.store.all("SELECT * FROM association_reviews WHERE aid = ? ORDER BY id", aid).map((rv) => ({
+        reviewer: identityDef(rv.reviewer_id)?.label ?? rv.reviewer_id,
+        approve: !!rv.approve,
+        digest: rv.digest,
+        rationale: readable ? this.ctx.vault.open("rationale", `assoc-review:${rv.id}`, rv.sealed).toString("utf8") : null,
+        tx: rv.tx_hash,
+        at: rv.created_at,
+      })),
+      tx: row?.tx_hash ?? null,
+    };
+  }
+
+  // ================================================================ disputes
+  async openDispute(viewer: Viewer, kind: number, subject: number, statement: string) {
+    const st = text(statement, "Statement", LIMITS.rationale);
+    const s = salt();
+    const digest = noteDigest(st, s);
+    const tx = await this.tx(viewer.id, "openDispute", [kind, subject, digest]);
+    const did = Number(tx.events.find((e) => e.name === "DisputeOpened")!.args.did);
+    const d = await this.disputeOnChain(did);
+    this.store.run(
+      `INSERT INTO disputes(did, kind, subject, cid_a, cid_b, opener_id, status, round, decision, reason_code, first_decision, first_reason,
+         reversed, policy_digest, salt, digest, sealed, opened_at, decided_at, tx_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, NULL, ?)`,
+      did, kind, subject, d.cidA, d.cidB || null, viewer.id, d.status, d.round, d.policyDigest, s, digest,
+      this.ctx.vault.seal("rationale", `dispute:${did}`, Buffer.from(st)), d.openedAt, tx.hash,
+    );
+    if (kind === 1) await this.refreshAssociation(subject);
+    return { did, tx: tx.hash };
+  }
+
+  /** Run a dispute transaction and keep the (sealed) rationale whose salted digest went on-chain. */
+  private async act(viewer: Viewer, did: number, act: string, method: string, args: unknown[], fields: { decision?: number; reason?: number; rationale?: string; salt?: string }) {
+    if (!this.store.get("SELECT did FROM disputes WHERE did = ?", did)) throw new ServiceError("Dispute not found", 404);
+    const before = await this.disputeOnChain(did);
+    const tx = await this.tx(viewer.id, method, args);
+    const digest = fields.rationale && fields.salt ? noteDigest(fields.rationale, fields.salt) : null;
+    const res = this.store.run(
+      "INSERT INTO dispute_acts(did, act, round, actor_id, decision, reason_code, salt, digest, sealed, tx_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+      did, act, before.round, viewer.id, fields.decision ?? null, fields.reason ?? null, fields.salt ?? null, digest, tx.hash, now(),
+    );
+    const id = Number(res.lastInsertRowid);
+    if (fields.rationale) this.store.run("UPDATE dispute_acts SET sealed = ? WHERE id = ?", this.ctx.vault.seal("rationale", `act:${id}`, Buffer.from(fields.rationale)), id);
+    await this.refreshDispute(did);
+    return { tx: tx.hash, events: tx.events.map((e) => e.name) };
+  }
+
+  vote(viewer: Viewer, did: number, decision: number, reasonCode: number, rationale: string) {
+    if (!REASON_CODES[reasonCode]) throw new ServiceError("Unknown reason code", 422);
+    const why = text(rationale, "Rationale", LIMITS.rationale);
+    const s = salt();
+    return this.act(viewer, did, "vote", "vote", [did, decision, reasonCode, noteDigest(why, s)], { decision, reason: reasonCode, rationale: why, salt: s });
+  }
+
+  recuse(viewer: Viewer, did: number) {
+    return this.act(viewer, did, "recuse", "recuse", [did], {});
+  }
+
+  appeal(viewer: Viewer, did: number, statement: string) {
+    const why = text(statement, "Appeal statement", LIMITS.rationale);
+    const s = salt();
+    return this.act(viewer, did, "appeal", "appeal", [did, noteDigest(why, s)], { rationale: why, salt: s });
+  }
+
+  closeDispute(viewer: Viewer, did: number) {
+    return this.act(viewer, did, "close", "closeDispute", [did], {});
+  }
+
+  private async refreshDispute(did: number) {
+    const d = await this.disputeOnChain(did);
+    this.store.run(
+      "UPDATE disputes SET status = ?, round = ?, decision = ?, reason_code = ?, first_decision = ?, first_reason = ?, reversed = ?, decided_at = ? WHERE did = ?",
+      d.status, d.round, d.decision || null, d.reasonCode || null, d.firstDecision || null, d.firstReason || null, d.reversed ? 1 : 0, d.decidedAt || null, did,
+    );
+    if (d.kind === 1 || d.kind === 2) await this.refreshAssociation(d.subject);
+    for (const cid of [d.cidA, d.cidB]) if (cid) await this.refreshReport(cid);
     return d;
   }
 
-  // -- writes ----------------------------------------------------------------
-  async registerDevice(actorId: string | undefined, input: DeviceInput) {
-    const actor = this.requireActor(actorId);
-    const brand = str(input.brand, "Brand", { required: true, max: 40 })!;
-    const model = str(input.model, "Model", { required: true, max: 60 })!;
-    const formFactor = oneOf(input.formFactor ?? "laptop", FORM_FACTORS, "Form factor", true)!;
-    let year: number | undefined;
-    if (input.year !== undefined && input.year !== null && String(input.year) !== "") {
-      year = Number(input.year);
-      if (!Number.isInteger(year) || year < 1990 || year > new Date().getFullYear() + 1) throw new ServiceError("Year must be a valid model year", 422);
-    }
-    const publicId = newPublicId();
-    const deviceKey = deviceKeyFor(publicId);
-    const payload = {
-      schema: "patchledger.registration.v1",
-      type: "REGISTRATION",
-      device: publicId,
-      brand,
-      model,
-      year,
-      formFactor,
-      synthetic: input.synthetic ? true : undefined,
-      nonce: nonce(),
-    };
-    const canonical = canonicalize(payload);
-    const digest = payloadDigest(canonical);
-    const res = await this.ledger.registerDevice(actor, deviceKey, digest);
-    const created = nowIso();
-    this.store.transaction(() => {
-      this.store.insertDevice({
-        public_id: publicId,
-        device_key: deviceKey,
-        brand,
-        model,
-        year: year ?? null,
-        form_factor: formFactor,
-        synthetic: input.synthetic ? 1 : 0,
-        created_at: created,
-      });
-      this.insertEventRow(publicId, "REGISTRATION", canonical, digest, actor, res, null, 0);
-    });
-    return { publicId, deviceKey, tx: res };
-  }
-
-  private insertEventRow(publicId: string, type: RecordType, canonical: string, digest: string, actor: string, res: WriteResult, refSeq: number | null, outcome: number) {
-    this.store.insertEvent({
-      public_id: publicId,
-      seq: res.seq,
-      type,
-      payload: canonical,
-      payload_digest: digest,
-      record_hash: res.recordHash,
-      prev_hash: res.prevHash,
-      actor_address: this.ledger.addressOf(actor),
-      actor_id: actor,
-      ref_seq: refSeq,
-      outcome,
-      chain_ts: res.timestamp,
-      tx_hash: res.txHash,
-      block_number: res.blockNumber,
-      gas_used: res.gasUsed,
-      created_at: nowIso(),
-    });
-  }
-
-  uploadEvidence(
-    actorId: string | undefined,
-    publicId: string,
-    file: { buffer: Uint8Array; originalname: string; mimetype: string } | undefined,
-    meta: { kind?: string; description?: string; access?: string },
-  ) {
-    const actor = this.requireActor(actorId);
-    this.requireDevice(publicId);
-    if (!file) throw new ServiceError("No file was uploaded", 422);
-    if (!ALLOWED_MIME.has(file.mimetype)) throw new ServiceError(`File type ${file.mimetype} is not accepted. Allowed: PDF, PNG, JPEG, WebP, SVG, text, CSV, JSON.`, 415);
-    if (file.buffer.byteLength === 0) throw new ServiceError("The uploaded file is empty", 422);
-    if (file.buffer.byteLength > MAX_EVIDENCE_BYTES) throw new ServiceError("Evidence files are limited to 10 MB", 413);
-    const kind = oneOf(meta.kind ?? "other", EVIDENCE_KINDS, "Evidence kind", true)!;
-    const description = str(meta.description, "Evidence description", { max: 300 }) ?? "";
-    const access = oneOf(meta.access ?? "restricted", ["restricted", "shareable"] as const, "Access", true)!;
-    const filename = (file.originalname || "evidence").replace(/[^\w.\- ]+/g, "_").slice(0, 120);
-    const id = `EV-${randomCode(10)}`;
-    const { storedName, sha256, size } = this.vault.store(id, file.mimetype, file.buffer);
-    const prior = this.store.evidenceBySha(sha256);
-    const row: EvidenceRow = {
-      id,
-      public_id: publicId,
-      filename,
-      stored_name: storedName,
-      mime: file.mimetype,
-      size,
-      sha256,
-      kind,
-      description,
-      uploaded_by: actor,
-      access,
-      linked_seq: null,
-      created_at: nowIso(),
-    };
-    this.store.insertEvidence(row);
-    const warnings = prior.length
-      ? [
-          `Digest reuse warning: an identical file (SHA-256 ${sha256.slice(0, 12)}…) was already submitted as ${prior
-            .map((p) => `${p.id} for ${p.public_id}${p.linked_seq !== null ? ` record #${p.linked_seq}` : ""}`)
-            .join(", ")}. Re-using one document for several claims may indicate a recycled or copied receipt.`,
-        ]
-      : [];
-    return { evidence: this.evidenceView(row, actor, -1, sha256), warnings };
-  }
-
-  async appendEvent(actorId: string | undefined, publicId: string, input: EventInput) {
-    const actor = this.requireActor(actorId);
-    const device = this.requireDevice(publicId);
-    const type = input.type as RecordType;
-    if (!RECORD_TYPES.includes(type) || type === "REGISTRATION") throw new ServiceError(`Unsupported record type "${input.type}"`, 422);
-
-    const rows = this.store.listEvents(publicId);
-    let ref: EventRow | undefined;
-    if (REF_TYPES.includes(type)) {
-      if (input.refSeq === undefined || input.refSeq === null || !Number.isInteger(Number(input.refSeq)))
-        throw new ServiceError(`${RECORD_TYPE_LABEL[type]} must reference an earlier record`, 422);
-      ref = rows.find((r) => r.seq === Number(input.refSeq));
-      if (!ref) throw new ServiceError(`Record #${input.refSeq} does not exist for ${publicId}`, 422);
-    } else if (input.refSeq !== undefined && input.refSeq !== null) {
-      throw new ServiceError(`${RECORD_TYPE_LABEL[type]} records cannot reference another record`, 422);
-    }
-
-    // evidence: must exist, belong to this device, be unlinked and uploaded by the submitter
-    const evIds = [...new Set(input.evidenceIds ?? [])];
-    if (evIds.length > 10) throw new ServiceError("At most 10 evidence files per record", 422);
-    const evRows = evIds.map((id) => {
-      const e = this.store.getEvidence(id);
-      if (!e || e.public_id !== publicId) throw new ServiceError(`Evidence ${id} not found for this device`, 422);
-      if (e.linked_seq !== null) throw new ServiceError(`Evidence ${id} is already committed in record #${e.linked_seq}`, 409);
-      if (e.uploaded_by !== actor) throw new ServiceError(`Evidence ${id} was uploaded by another identity; each party commits its own evidence`, 403);
-      const check = this.vault.verify(e.stored_name, e.sha256);
-      if (check.status !== "match") throw new ServiceError(`Evidence ${id} failed its integrity check (${check.status}); refusing to commit it`, 409);
-      return e;
-    });
-    if (type === "EVIDENCE_ATTACHMENT" && evRows.length === 0) throw new ServiceError("Attach at least one evidence file", 422);
-
-    const payload = this.buildPayload(device, type, input, evRows, ref);
-    const canonical = canonicalize(payload);
-    const digest = payloadDigest(canonical);
-    const outcome = type === "RESOLUTION" ? OUTCOMES.indexOf(payload.outcome as Outcome) : 0;
-    const expected = input.expectedPrevHash ? str(input.expectedPrevHash, "expectedPrevHash", { max: 66 }) : undefined;
-
-    const res = await this.ledger.appendRecord(actor, {
-      deviceKey: device.device_key,
-      recordType: typeCode(type),
-      expectedPrevHash: expected,
-      payloadDigest: digest,
-      refSeq: ref ? ref.seq : NO_REF,
-      outcome,
-    });
-    this.store.transaction(() => {
-      this.insertEventRow(publicId, type, canonical, digest, actor, res, ref ? ref.seq : null, outcome);
-      this.store.linkEvidence(evIds, res.seq);
-    });
-    const warnings = evRows.flatMap((e) =>
-      this.store.evidenceBySha(e.sha256).filter((o) => o.id !== e.id).length
-        ? [`Evidence ${e.id} has the same digest as a file submitted elsewhere — flagged as reused.`]
-        : [],
-    );
-    return { seq: res.seq, recordHash: res.recordHash, tx: res, warnings };
-  }
-
-  private buildPayload(device: DeviceRow, type: RecordType, input: EventInput, evRows: EvidenceRow[], ref?: EventRow): Record<string, unknown> {
-    const base: Record<string, unknown> = {
-      schema: "patchledger.event.v1",
-      type,
-      device: device.public_id,
-      nonce: nonce(),
-      evidence: evRows.map((e) => ({ id: e.id, kind: e.kind, sha256: e.sha256 })).sort((a, b) => (a.id < b.id ? -1 : 1)),
-    };
-    if (ref) base.ref = { seq: ref.seq, recordHash: ref.record_hash, type: ref.type };
-    const assertions = () =>
-      (input.componentAssertions ?? []).slice(0, 12).map((a) => ({
-        component: oneOf(a.component, COMPONENTS, "Asserted component", true)!,
-        state: oneOf(a.state, ["original", "replaced"] as const, "Asserted state", true)!,
-      }));
-    const measurements = () => {
-      if (!input.measurements) return undefined;
-      const out: Record<string, number | string> = {};
-      for (const [k, v] of Object.entries(input.measurements).slice(0, 12)) {
-        if (!/^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(k)) throw new ServiceError(`Invalid measurement name "${k}"`, 422);
-        if (typeof v === "number") {
-          if (!Number.isSafeInteger(v)) throw new ServiceError(`Measurement ${k} must be an integer (record decimals as text)`, 422);
-          out[k] = v;
-        } else out[k] = str(v, `Measurement ${k}`, { max: 60 }) ?? "";
-      }
-      return Object.keys(out).length ? out : undefined;
-    };
-    const claimedAt = isoDate(input.claimedAt, "Date performed");
-
-    switch (type) {
-      case "DIAGNOSTIC":
-        return {
-          ...base,
-          claimedAt,
-          category: oneOf(input.category, CATEGORIES, "Category", true),
-          component: oneOf(input.component, COMPONENTS, "Component"),
-          description: str(input.description, "Description", { required: true, max: 1500 }),
-          result: oneOf(input.result, RESULTS, "Result", true),
-          componentAssertions: assertions(),
-          measurements: measurements(),
-        };
-      case "REPAIR":
-        return {
-          ...base,
-          claimedAt,
-          category: oneOf(input.category, CATEGORIES, "Category", true),
-          component: oneOf(input.component, COMPONENTS, "Component"),
-          description: str(input.description, "Description", { required: true, max: 1500 }),
-          result: oneOf(input.result, RESULTS, "Result", true),
-          componentAssertions: assertions(),
-        };
-      case "COMPONENT_REPLACEMENT": {
-        const component = oneOf(input.component, COMPONENTS, "Component", true)!;
-        return {
-          ...base,
-          claimedAt,
-          category: oneOf(input.category, CATEGORIES, "Category") ?? (component === "battery" ? "battery" : "general"),
-          component,
-          partOrigin: oneOf(input.partOrigin, PART_ORIGINS, "Part origin", true),
-          description: str(input.description, "Description", { required: true, max: 1500 }),
-          result: oneOf(input.result ?? "replaced", RESULTS, "Result", true),
-          componentAssertions: [{ component, state: "replaced" }],
-        };
-      }
-      case "INSPECTION":
-        return {
-          ...base,
-          claimedAt,
-          category: oneOf(input.category ?? "general", CATEGORIES, "Category", true),
-          description: str(input.description, "Description", { required: true, max: 1500 }),
-          result: oneOf(input.result, RESULTS, "Result", true),
-          componentAssertions: assertions(),
-          measurements: measurements(),
-        };
-      case "CUSTODY_TRANSFER":
-        return {
-          ...base,
-          claimedAt,
-          fromParty: str(input.fromParty, "From (organisation or role)", { required: true, max: 80 }),
-          toParty: str(input.toParty, "To (organisation or role)", { required: true, max: 80 }),
-          description: str(input.description, "Note", { max: 500 }),
-        };
-      case "EVIDENCE_ATTACHMENT":
-        return { ...base, description: str(input.description, "Description", { max: 500 }) };
-      case "CORROBORATION":
-        return {
-          ...base,
-          claimedAt,
-          description: str(input.description, "Corroboration note", { required: true, max: 1000 }),
-          result: oneOf(input.result ?? "observed", RESULTS, "Result", true),
-        };
-      case "CHALLENGE":
-        return { ...base, reason: str(input.reason, "Reason for the challenge", { required: true, max: 1500 }) };
-      case "RESOLUTION": {
-        if (ref?.type !== "CHALLENGE") throw new ServiceError("A resolution must reference a challenge record", 422);
-        const outcome = oneOf(input.outcome, ["CLAIM_UPHELD", "CLAIM_REJECTED", "INCONCLUSIVE"] as const, "Outcome", true);
-        return { ...base, outcome, reason: str(input.reason, "Resolution reasoning", { required: true, max: 1500 }) };
-      }
-      case "CORRECTION":
-        return {
-          ...base,
-          reason: str(input.reason, "What is being corrected and why", { required: true, max: 1000 }),
-          corrected: {
-            description: str(input.description, "Corrected description", { max: 1500 }),
-            component: oneOf(input.component, COMPONENTS, "Component"),
-            result: oneOf(input.result, RESULTS, "Result"),
-            componentAssertions: assertions(),
-          },
-        };
-      default:
-        throw new ServiceError(`Unsupported record type ${type}`, 422);
-    }
-  }
-
-  // -- reads -----------------------------------------------------------------
-  listDevices() {
-    return this.store.listDevices().map((d) => {
-      const evs = this.store.listEvents(d.public_id);
-      const open = this.openChallengeSeqs(evs);
-      return {
-        publicId: d.public_id,
-        brand: d.brand,
-        model: d.model,
-        year: d.year,
-        formFactor: d.form_factor,
-        synthetic: !!d.synthetic,
-        records: evs.length,
-        openDisputes: open.size,
-        lastRecordedAt: evs.length ? new Date(evs[evs.length - 1].chain_ts * 1000).toISOString() : null,
-      };
-    });
-  }
-
-  private openChallengeSeqs(evs: EventRow[]): Set<number> {
-    const resolved = new Set(evs.filter((e) => e.type === "RESOLUTION").map((e) => e.ref_seq));
-    return new Set(evs.filter((e) => e.type === "CHALLENGE" && !resolved.has(e.seq)).map((e) => e.seq));
-  }
-
-  canViewEvidence(viewer: string | undefined, e: EvidenceRow): boolean {
-    if (!viewer || !identityById(viewer)) return false;
-    if (viewer === e.uploaded_by || viewer === "auditor" || viewer === "registrar" || viewer === "inspector") return true;
-    return e.access === "shareable" && viewer !== "outsider";
-  }
-
-  private evidenceView(e: EvidenceRow | undefined, viewer: string | undefined, seq: number, committedSha: string, ref?: { id: string; kind: string }): EvidenceView {
-    if (!e) {
-      return {
-        id: ref?.id ?? "?",
-        kind: ref?.kind ?? "other",
-        sha256: committedSha,
-        mime: "",
-        size: 0,
-        filename: "",
-        description: "",
-        uploadedBy: { id: "unknown", label: "unknown" },
-        access: "restricted",
-        committedInSeq: seq,
-        committedSha256: committedSha,
-        integrity: "unknown-evidence",
-        canViewContent: false,
-        reusedElsewhere: [],
-      };
-    }
-    const check = this.vault.verify(e.stored_name, e.sha256);
-    const uploader = identityById(e.uploaded_by);
+  disputeSummary(d: ChainDispute) {
     return {
-      id: e.id,
-      kind: e.kind,
-      sha256: e.sha256,
-      mime: e.mime,
-      size: e.size,
-      filename: e.filename,
-      description: e.description,
-      uploadedBy: { id: e.uploaded_by, label: uploader?.label ?? e.uploaded_by },
-      access: e.access,
-      committedInSeq: seq,
-      committedSha256: committedSha,
-      integrity: committedSha !== e.sha256 ? "commitment-mismatch" : check.status,
-      canViewContent: this.canViewEvidence(viewer, e),
-      reusedElsewhere: this.store
-        .evidenceBySha(e.sha256)
-        .filter((o) => o.id !== e.id)
-        .map((o) => ({ id: o.id, publicId: o.public_id, seq: o.linked_seq })),
+      did: d.did,
+      kind: d.kind,
+      kindName: DISPUTE_KIND_NAMES[d.kind],
+      status: d.status,
+      statusName: DISPUTE_STATUS[d.status],
+      round: d.round,
+      subject: d.subject,
+      refs: [d.cidA, d.cidB].filter(Boolean).map(reportRef),
+      programs: [d.progA, d.progB].filter(Boolean).map((p) => programDef(p)?.short),
+      decision: d.decision || null,
+      decisionName: d.decision ? DECISION_NAMES[d.decision] : null,
+      reasonCode: d.reasonCode || null,
+      openedAt: iso(d.openedAt),
+      decidedAt: iso(d.decidedAt),
     };
-  }
-
-  /** Build the decorated timeline from off-chain rows and (if reachable) the chain. */
-  async getPassport(publicId: string, viewer?: string) {
-    const device = this.requireDevice(publicId);
-    const rows = this.store.listEvents(publicId);
-    let chainRecs: OnChainRecord[] | null = null;
-    let chainError: string | null = null;
-    try {
-      chainRecs = await this.ledger.getRecords(device.device_key);
-    } catch (e) {
-      chainError = (e as Error).message;
-    }
-    const events = this.decorate(rows, chainRecs, viewer);
-    const conflicts = detectConflicts(events);
-    for (const c of conflicts) {
-      if (c.status === "open") {
-        for (const s of [c.replacedSeq, c.assertedOriginalSeq]) events[s]?.flags.push(`Conflicting claim about the ${c.component} (see records #${c.replacedSeq} and #${c.assertedOriginalSeq})`);
-      }
-    }
-    const head = rows.length ? rows[rows.length - 1].record_hash : null;
-    return {
-      device: {
-        publicId: device.public_id,
-        deviceKey: device.device_key,
-        brand: device.brand,
-        model: device.model,
-        year: device.year,
-        formFactor: device.form_factor,
-        synthetic: !!device.synthetic,
-        createdAt: device.created_at,
-      },
-      headHash: head,
-      onChainHeadHash: chainRecs && chainRecs.length ? chainRecs[chainRecs.length - 1].recordHash : null,
-      onChainRecords: chainRecs?.length ?? null,
-      chainError,
-      events,
-      conflicts,
-      openDisputes: events.filter((e) => e.type === "CHALLENGE" && e.challenges.length === 0 && !events.some((r) => r.type === "RESOLUTION" && r.refSeq === e.seq)).length,
-      pendingEvidence: this.store
-        .evidenceForDevice(publicId)
-        .filter((e) => e.linked_seq === null && (!viewer || e.uploaded_by === viewer))
-        .map((e) => this.evidenceView(e, viewer, -1, e.sha256)),
-    };
-  }
-
-  private decorate(rows: EventRow[], chainRecs: OnChainRecord[] | null, viewer?: string): EventView[] {
-    const parsed = rows.map((r) => JSON.parse(r.payload) as Record<string, any>);
-    const byRef = (type: RecordType, seq: number) => rows.filter((r) => r.type === type && r.ref_seq === seq);
-    const contract = this.ledger.address;
-    const chainId = this.ledger.chainId;
-
-    const views: EventView[] = rows.map((r, i) => {
-      const type = r.type as RecordType;
-      const p = parsed[i];
-      // anchor status
-      let anchor: EventView["anchor"] = "chain-unavailable";
-      if (chainRecs) {
-        const c = chainRecs[r.seq];
-        if (!c) anchor = "not-on-chain";
-        else if (canonicalize(p) !== r.payload) anchor = "payload-not-canonical";
-        else if (payloadDigest(r.payload) !== c.payloadDigest) anchor = "digest-mismatch";
-        else if (r.record_hash !== c.recordHash) anchor = "hash-mismatch";
-        else anchor = "anchored";
-      }
-      // evidence: own + attachments
-      const evidence: EvidenceView[] = [];
-      const collect = (payload: Record<string, any>, seq: number) => {
-        for (const ev of (payload.evidence ?? []) as { id: string; kind: string; sha256: string }[]) {
-          evidence.push(this.evidenceView(this.store.getEvidence(ev.id), viewer, seq, ev.sha256, ev));
-        }
-      };
-      collect(p, r.seq);
-      for (const a of byRef("EVIDENCE_ATTACHMENT", r.seq)) collect(parsed[a.seq], a.seq);
-
-      const challenges = byRef("CHALLENGE", r.seq).map((c) => {
-        const res = byRef("RESOLUTION", c.seq)[0];
-        return { seq: c.seq, resolvedBySeq: res ? res.seq : null, outcome: res ? (OUTCOMES[res.outcome] as Outcome) : null };
-      });
-      const open = challenges.find((c) => c.resolvedBySeq === null);
-      const correction = byRef("CORRECTION", r.seq)[0];
-      const corroborations = byRef("CORROBORATION", r.seq).filter((c) => c.actor_address.toLowerCase() !== r.actor_address.toLowerCase());
-      const flags: string[] = [];
-
-      let category: Category;
-      const evOk = evidence.length > 0 && evidence.every((e) => e.integrity === "match");
-      const evBad = evidence.some((e) => e.integrity !== "match");
-      if (!isClaimType(type)) category = "dispute-record";
-      else if (open) category = "disputed";
-      else if (correction) category = "superseded";
-      else if (evBad) category = "evidence-failed";
-      else if (
-        corroborations.some((c) => {
-          const cp = parsed[c.seq];
-          return (cp.evidence ?? []).length > 0 && (cp.evidence as { id: string; sha256: string }[]).every((ev) => {
-            const row = this.store.getEvidence(ev.id);
-            return row && row.sha256 === ev.sha256 && this.vault.verify(row.stored_name, row.sha256).status === "match";
-          });
-        })
-      )
-        category = "corroborated";
-      else if (evOk) category = "evidence-attached";
-      else category = "self-reported";
-
-      if (evBad) flags.push("One or more evidence files no longer match their committed SHA-256 digest");
-      if (evidence.some((e) => e.reusedElsewhere.length)) flags.push("Evidence digest reused in another submission");
-      const rejected = challenges.find((c) => c.outcome === "CLAIM_REJECTED");
-      if (rejected) flags.push(`Auditor judged this claim inaccurate (resolution #${rejected.resolvedBySeq})`);
-      if (corroborations.length && category !== "corroborated" && category !== "disputed" && category !== "superseded")
-        flags.push("Corroborated without supporting evidence (acknowledgement only)");
-      if (anchor !== "anchored" && anchor !== "chain-unavailable") flags.push(`Off-chain record does not match on-chain commitment (${anchor})`);
-
-      return {
-        seq: r.seq,
-        type,
-        typeLabel: RECORD_TYPE_LABEL[type],
-        payload: p,
-        claimedAt: (p.claimedAt as string) ?? null,
-        recordedAt: new Date(r.chain_ts * 1000).toISOString(),
-        actor: this.identityByAddress(r.actor_address),
-        recordHash: r.record_hash,
-        prevHash: r.prev_hash,
-        payloadDigest: r.payload_digest,
-        txHash: r.tx_hash,
-        blockNumber: r.block_number,
-        gasUsed: r.gas_used,
-        refSeq: r.ref_seq,
-        outcome: OUTCOMES[r.outcome] as Outcome,
-        outcomeLabel: OUTCOME_LABEL[OUTCOMES[r.outcome] as Outcome],
-        evidence,
-        category,
-        categoryLabel: CATEGORY_LABEL[category],
-        flags,
-        openChallengeSeq: open ? open.seq : null,
-        challenges,
-        supersededBySeq: correction ? correction.seq : null,
-        corroboratedBySeqs: corroborations.map((c) => c.seq),
-        anchor,
-      };
-    });
-    // the chain may contain records with no off-chain row (e.g. deleted from the DB)
-    if (chainRecs && chainRecs.length > rows.length) {
-      // surfaced by the integrity checker; nothing to decorate here
-    }
-    return views;
-  }
-
-  /** Public, read-only view: structured fields only, no free text, filenames or file contents. */
-  async getPublicView(publicId: string) {
-    const passport = await this.getPassport(publicId, undefined);
-    const integrity = await this.checkIntegrity(publicId);
-    return {
-      device: {
-        publicId: passport.device.publicId,
-        brand: passport.device.brand,
-        model: passport.device.model,
-        year: passport.device.year,
-        formFactor: passport.device.formFactor,
-        synthetic: passport.device.synthetic,
-      },
-      events: passport.events.map((e) => ({
-        seq: e.seq,
-        type: e.type,
-        typeLabel: e.typeLabel,
-        recordedAt: e.recordedAt,
-        claimedAt: e.claimedAt,
-        actorLabel: e.actor.label,
-        actorRole: e.actor.description,
-        category: e.payload.category ?? null,
-        component: e.payload.component ?? null,
-        result: e.payload.result ?? null,
-        partOrigin: e.payload.partOrigin ?? null,
-        outcome: e.type === "RESOLUTION" ? e.outcomeLabel : null,
-        refSeq: e.refSeq,
-        evidenceCategory: e.category,
-        evidenceCategoryLabel: e.categoryLabel,
-        openChallengeSeq: e.openChallengeSeq,
-        supersededBySeq: e.supersededBySeq,
-        flags: e.flags,
-        anchor: e.anchor,
-        recordHash: e.recordHash,
-        evidence: e.evidence.map((v) => ({ kind: v.kind, sha256: v.sha256, integrity: v.integrity })),
-      })),
-      conflicts: passport.conflicts,
-      openDisputes: passport.openDisputes,
-      integrity: {
-        ok: integrity.ok,
-        checkedAt: integrity.checkedAt,
-        errors: integrity.findings.filter((f) => f.severity === "error").length,
-        warnings: integrity.findings.filter((f) => f.severity === "warning").length,
-        findings: integrity.findings.map((f) => ({ severity: f.severity, code: f.code, seq: f.seq, message: f.message })),
-        headHash: integrity.chain.headHash,
-        contract: integrity.chain.contract,
-      },
-    };
-  }
-
-  getEvidenceDetail(id: string, viewer?: string) {
-    const e = this.store.getEvidence(id);
-    if (!e) throw new ServiceError(`Evidence ${id} not found`, 404);
-    let committedSha = e.sha256;
-    if (e.linked_seq !== null) {
-      const row = this.store.listEvents(e.public_id).find((r) => r.seq === e.linked_seq);
-      const ev = row ? ((JSON.parse(row.payload).evidence ?? []) as { id: string; sha256: string }[]).find((x) => x.id === id) : undefined;
-      if (ev) committedSha = ev.sha256;
-    }
-    const view = this.evidenceView(e, viewer, e.linked_seq ?? -1, committedSha);
-    return { ...view, publicId: e.public_id, linkedSeq: e.linked_seq, createdAt: e.created_at };
-  }
-
-  evidenceFile(id: string, viewer?: string): { path: string; mime: string; filename: string } {
-    const e = this.store.getEvidence(id);
-    if (!e) throw new ServiceError(`Evidence ${id} not found`, 404);
-    if (!this.canViewEvidence(viewer, e))
-      throw new ServiceError("Your current identity may see this evidence's metadata and digest, but not its contents.", 403);
-    return { path: this.vault.pathOf(e.stored_name), mime: e.mime, filename: e.filename };
-  }
-
-  verifyEvidence(id: string) {
-    const e = this.store.getEvidence(id);
-    if (!e) throw new ServiceError(`Evidence ${id} not found`, 404);
-    const file = this.vault.verify(e.stored_name, e.sha256);
-    let commitment: { seq: number; committedSha256: string; matchesDatabase: boolean; onChainPayloadMatches: boolean | null } | null = null;
-    if (e.linked_seq !== null) {
-      const row = this.store.listEvents(e.public_id).find((r) => r.seq === e.linked_seq);
-      const committed = row ? ((JSON.parse(row.payload).evidence ?? []) as { id: string; sha256: string }[]).find((x) => x.id === id) : undefined;
-      commitment = {
-        seq: e.linked_seq,
-        committedSha256: committed?.sha256 ?? "",
-        matchesDatabase: committed?.sha256 === e.sha256,
-        onChainPayloadMatches: null,
-      };
-    }
-    const fileMatchesCommitment = commitment ? file.actual === commitment.committedSha256 : null;
-    return {
-      evidenceId: id,
-      file,
-      commitment,
-      fileMatchesCommitment,
-      verdict:
-        file.status === "match" && (commitment === null || commitment.matchesDatabase)
-          ? "The stored file is byte-for-byte identical to the file originally submitted. This shows integrity, not that its contents are true."
-          : file.status === "missing"
-            ? "The evidence file is missing from local storage."
-            : "The stored file or its recorded digest has changed since submission.",
-    };
-  }
-
-  async verifyEvidenceOnChain(id: string) {
-    const base = this.verifyEvidence(id);
-    if (base.commitment) {
-      const e = this.store.getEvidence(id)!;
-      const device = this.store.getDevice(e.public_id)!;
-      const row = this.store.listEvents(e.public_id).find((r) => r.seq === e.linked_seq)!;
-      const recs = await this.ledger.getRecords(device.device_key);
-      base.commitment.onChainPayloadMatches = recs[row.seq]?.payloadDigest === payloadDigest(row.payload);
-    }
-    return base;
   }
 
   async disputes() {
-    const out: any[] = [];
-    for (const d of this.store.listDevices()) {
-      const rows = this.store.listEvents(d.public_id);
-      for (const c of rows.filter((r) => r.type === "CHALLENGE")) {
-        const target = rows.find((r) => r.seq === c.ref_seq);
-        const res = rows.find((r) => r.type === "RESOLUTION" && r.ref_seq === c.seq);
-        const cp = JSON.parse(c.payload);
-        const tp = target ? JSON.parse(target.payload) : {};
-        out.push({
-          publicId: d.public_id,
-          device: `${d.brand} ${d.model}`,
-          challengeSeq: c.seq,
-          targetSeq: c.ref_seq,
-          targetType: target?.type,
-          targetTypeLabel: target ? RECORD_TYPE_LABEL[target.type as RecordType] : "",
-          targetSummary: tp.description ?? tp.reason ?? "",
-          targetActor: target ? this.identityByAddress(target.actor_address) : null,
-          challenger: this.identityByAddress(c.actor_address),
-          reason: cp.reason,
-          evidenceCount: (cp.evidence ?? []).length,
-          raisedAt: new Date(c.chain_ts * 1000).toISOString(),
-          status: res ? "resolved" : "open",
-          resolution: res
-            ? {
-                seq: res.seq,
-                outcome: OUTCOMES[res.outcome],
-                outcomeLabel: OUTCOME_LABEL[OUTCOMES[res.outcome] as Outcome],
-                reason: JSON.parse(res.payload).reason,
-                auditor: this.identityByAddress(res.actor_address),
-                resolvedAt: new Date(res.chain_ts * 1000).toISOString(),
-              }
-            : null,
-        });
-      }
-    }
-    return out.sort((a, b) => (a.status === b.status ? (a.raisedAt < b.raisedAt ? 1 : -1) : a.status === "open" ? -1 : 1));
+    const rows = this.store.all("SELECT did FROM disputes ORDER BY did DESC");
+    return Promise.all(rows.map(async (r) => this.disputeSummary(await this.disputeOnChain(r.did))));
+  }
+
+  async disputeView(viewer: Viewer, did: number) {
+    const row = this.store.get("SELECT * FROM disputes WHERE did = ?", did);
+    if (!row) throw new ServiceError("Dispute not found", 404);
+    const d = await this.disputeOnChain(did);
+    const progs = [d.progA, d.progB].filter(Boolean);
+    const researchers = [d.cidA, d.cidB].filter(Boolean).map((cid) => this.store.get("SELECT researcher_id FROM reports WHERE cid = ?", cid)?.researcher_id);
+    const isParty = researchers.includes(viewer.id) || ((viewer.kind === "program-admin" || viewer.kind === "reviewer") && progs.includes(viewer.programId));
+    const readable = isParty || this.canReadRationale(viewer, progs);
+    const conflicted = viewer.kind === "arbitrator" && viewer.programId !== 0 && progs.includes(viewer.programId);
+    const appealDeadline = d.decidedAt ? d.decidedAt + Number(await this.ledger.read("appealWindow")) : null;
+    const policy = this.store.get("SELECT * FROM policies WHERE program_id = ? AND digest = ?", d.progA, d.policyDigest);
+    return {
+      ...this.disputeSummary(d),
+      opener: this.labelOf(d.opener),
+      openerId: row.opener_id,
+      statement: readable ? this.ctx.vault.open("rationale", `dispute:${did}`, row.sealed).toString("utf8") : null,
+      statementDigest: row.digest,
+      firstDecision: d.firstDecision || null,
+      firstDecisionName: d.firstDecision ? DECISION_NAMES[d.firstDecision] : null,
+      firstReason: d.firstReason || null,
+      reversed: d.reversed,
+      priorityTo: d.priorityTo ? reportRef(d.priorityTo) : null,
+      policy: { digest: d.policyDigest, programId: d.progA, version: policy?.version ?? null, title: policy ? String(policy.body).split("\n")[0] : null },
+      appealDeadline: appealDeadline ? iso(appealDeadline) : null,
+      appealOpen: d.status === 2 && appealDeadline !== null && Date.now() / 1000 <= appealDeadline,
+      threshold: Number(await this.ledger.read("threshold")),
+      viewerIsParty: isParty,
+      viewerConflicted: conflicted,
+      association: d.kind !== 3 ? await this.associationView(viewer, d.subject) : null,
+      acts: this.store.all("SELECT * FROM dispute_acts WHERE did = ? ORDER BY id", did).map((a) => ({
+        act: a.act,
+        round: a.round,
+        actor: identityDef(a.actor_id)?.label ?? a.actor_id,
+        decision: a.decision,
+        decisionName: a.decision ? DECISION_NAMES[a.decision] : null,
+        reasonCode: a.reason_code,
+        reason: a.reason_code ? REASON_CODES[a.reason_code] : null,
+        digest: a.digest,
+        rationale: readable && a.sealed ? this.ctx.vault.open("rationale", `act:${a.id}`, a.sealed).toString("utf8") : null,
+        tx: a.tx_hash,
+        at: a.created_at,
+      })),
+      timeline: this.store.all("SELECT * FROM chain_events WHERE kind IN (13,14,15,16,17,18) AND subject = ? ORDER BY seq", String(did)).map((e) => this.eventView(e)),
+    };
+  }
+
+  // ================================================================ overview
+  async explorer() {
+    const snap = await this.snapshot();
+    const reveals = new Map<number, Row[]>();
+    for (const r of this.store.all("SELECT cid, outcome, precheck FROM reveals")) reveals.set(r.cid, [...(reveals.get(r.cid) ?? []), r]);
+    return {
+      commitments: snap.commitments.map((c) => ({
+        cid: c.cid,
+        ref: reportRef(c.cid),
+        program: programDef(c.programId)?.short,
+        programId: c.programId,
+        researcher: this.labelOf(c.researcher),
+        commitment: c.commitment,
+        anchoredAt: iso(c.anchoredAt),
+        status: c.status,
+        statusName: STATUS[c.status],
+        revealState: c.status >= ST.REVEALED ? "verified match" : c.mismatches ? `${c.mismatches} failed reveal check(s)` : reveals.has(c.cid) ? "revealed, awaiting verification" : "not revealed",
+        family: c.family === ZeroHash ? null : c.family,
+        supersedes: c.supersedes || null,
+        supersededBy: c.supersededBy || null,
+      })),
+      associations: snap.associations.map((s) => ({
+        aid: s.aid,
+        refA: reportRef(s.cidA),
+        refB: reportRef(s.cidB),
+        relationName: RELATION_NAMES[s.relation],
+        statusName: ASSOC_STATUS[s.status],
+        decidedRelationName: s.decidedRelation ? RELATION_NAMES[s.decidedRelation] : null,
+        proposer: this.labelOf(s.proposer).label,
+        reviewer: s.reviewer === "0x0000000000000000000000000000000000000000" ? null : this.labelOf(s.reviewer).label,
+      })),
+      disputes: snap.disputes.map((d) => this.disputeSummary(d)),
+    };
   }
 
   async dashboard() {
-    const devices = this.store.listDevices();
-    let chain: any = null;
-    let chainError: string | null = null;
-    try {
-      chain = { ...(await this.ledger.stats()), contract: this.ledger.address, chainId: this.ledger.chainId, rpcUrl: this.ledger.rpcUrl };
-    } catch (e) {
-      chainError = (e as Error).message;
-    }
-    let repairEvents = 0,
-      evidenceBacked = 0,
-      claims = 0,
-      openDisputes = 0,
-      conflicts = 0,
-      evidenceFiles = 0;
-    const categoryCounts: Record<string, number> = {};
-    for (const d of devices) {
-      const rows = this.store.listEvents(d.public_id);
-      const events = this.decorate(rows, null, undefined);
-      for (const e of events) {
-        if (["DIAGNOSTIC", "REPAIR", "COMPONENT_REPLACEMENT"].includes(e.type)) repairEvents++;
-        if (isClaimType(e.type) && e.type !== "REGISTRATION") {
-          claims++;
-          categoryCounts[e.category] = (categoryCounts[e.category] ?? 0) + 1;
-          if (e.category === "evidence-attached" || e.category === "corroborated") evidenceBacked++;
-        }
-      }
-      openDisputes += this.openChallengeSeqs(rows).size;
-      conflicts += detectConflicts(events).filter((c) => c.status === "open").length;
-      evidenceFiles += this.store.evidenceForDevice(d.public_id).filter((e) => e.linked_seq !== null).length;
-    }
-    const recent = this.store.recentEvents(12).map((r) => {
-      const d = this.store.getDevice(r.public_id)!;
-      const p = JSON.parse(r.payload);
-      return {
-        publicId: r.public_id,
-        device: `${d.brand} ${d.model}`,
-        seq: r.seq,
-        type: r.type,
-        typeLabel: RECORD_TYPE_LABEL[r.type as RecordType],
-        actor: this.identityByAddress(r.actor_address),
-        recordedAt: new Date(r.chain_ts * 1000).toISOString(),
-        summary: p.description ?? p.reason ?? (r.type === "REGISTRATION" ? `${p.brand} ${p.model} registered` : ""),
-        recordHash: r.record_hash,
-      };
-    });
+    const snap = await this.snapshot();
+    const researchers = await Promise.all(
+      IDENTITY_DEFS.filter((d) => d.kind === "researcher").map(async (d) => Number((await this.ledger.read("participants", this.ctx.keyring.address(d.id))).roles) & ROLE.RESEARCHER),
+    );
+    const live = snap.commitments.filter((c) => !c.supersededBy);
+    const recent = this.store.all("SELECT * FROM chain_events ORDER BY seq DESC LIMIT 14").map((e) => this.eventView(e));
     return {
-      totals: { devices: devices.length, repairEvents, claims, evidenceBacked, openDisputes, openConflicts: conflicts, evidenceFiles },
-      categoryCounts,
-      chain,
-      chainError,
+      totals: {
+        researchers: researchers.filter(Boolean).length,
+        programs: Number(await this.ledger.read("programCount")),
+        commitments: snap.commitments.length,
+        revealed: live.filter((c) => c.status >= ST.REVEALED).length,
+        unrevealed: live.filter((c) => c.status < ST.REVEALED).length,
+        awaitingTriage: live.filter((c) => c.status === ST.REVEALED || c.status === ST.PENDING_TRIAGE || c.status === ST.NEEDS_INFO).length,
+        openDisputes: snap.disputes.filter((d) => d.status !== 4).length,
+        openCrossProgram: snap.disputes.filter((d) => d.status !== 4 && d.progB !== 0).length,
+        completedArbitrations: snap.disputes.filter((d) => d.status === 4).length,
+        associations: snap.associations.length,
+        logEntries: Number(await this.ledger.read("logCount")),
+      },
+      chain: {
+        contract: this.ledger.address,
+        chainId: this.ledger.chainId,
+        rpcUrl: this.ledger.rpcUrl,
+        blockNumber: await this.ledger.provider.getBlockNumber(),
+        logHead: await this.ledger.read("logHead"),
+      },
       recent,
     };
   }
 
-  // -- integrity -------------------------------------------------------------
-  async checkIntegrity(publicId: string): Promise<IntegrityReport> {
-    const device = this.requireDevice(publicId);
-    const rows = this.store.listEvents(publicId);
-    const findings: Finding[] = [];
-    const report: IntegrityReport = {
-      publicId,
-      deviceKey: device.device_key,
-      checkedAt: nowIso(),
-      ok: false,
-      chain: { contract: this.ledger.address, chainId: this.ledger.chainId, onChainRecords: 0, offChainRecords: rows.length, headHash: null, contractVerifyChain: null },
-      evidenceChecked: 0,
-      findings,
-    };
-    if (deviceKeyFor(publicId) !== device.device_key)
-      findings.push({ severity: "error", code: "DEVICE_KEY_MISMATCH", message: "Stored device key does not derive from the public ID" });
-
-    let recs: OnChainRecord[];
-    try {
-      recs = await this.ledger.getRecords(device.device_key);
-      const v = await this.ledger.verifyChain(device.device_key);
-      report.chain.contractVerifyChain = v.ok;
-      if (!v.ok) findings.push({ severity: "error", code: "ONCHAIN_CHAIN_INVALID", seq: v.firstBadSeq, message: `Contract verifyChain() failed at record #${v.firstBadSeq}` });
-    } catch (e) {
-      findings.push({ severity: "error", code: "CHAIN_UNAVAILABLE", message: (e as Error).message });
-      report.ok = false;
-      return report;
-    }
-    report.chain.onChainRecords = recs.length;
-    report.chain.headHash = recs.length ? recs[recs.length - 1].recordHash : null;
-    if (recs.length === 0) findings.push({ severity: "error", code: "NOT_REGISTERED_ONCHAIN", message: "Device has no on-chain records" });
-
-    // 1. on-chain chain structure, recomputed locally
-    let prev = ZERO_HASH;
-    for (const c of recs) {
-      const h = computeRecordHash(this.ledger.chainId, this.ledger.address, device.device_key, c);
-      if (h !== c.recordHash) findings.push({ severity: "error", code: "ONCHAIN_HASH_MISMATCH", seq: c.seq, message: `On-chain record #${c.seq} hash does not recompute` });
-      if (c.prevHash !== prev) findings.push({ severity: "error", code: "ONCHAIN_LINK_BROKEN", seq: c.seq, message: `On-chain record #${c.seq} does not link to #${c.seq - 1}` });
-      prev = c.recordHash;
-    }
-
-    // 2. off-chain rows vs commitments
-    const bySeq = new Map(rows.map((r) => [r.seq, r]));
-    for (const c of recs) {
-      const r = bySeq.get(c.seq);
-      if (!r) {
-        findings.push({ severity: "error", code: "OFFCHAIN_RECORD_MISSING", seq: c.seq, message: `Record #${c.seq} exists on-chain but its off-chain payload is missing (deleted or never stored)` });
-        continue;
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(r.payload);
-      } catch {
-        findings.push({ severity: "error", code: "PAYLOAD_UNPARSEABLE", seq: c.seq, message: `Record #${c.seq} payload is not valid JSON` });
-        continue;
-      }
-      if (canonicalize(parsed) !== r.payload)
-        findings.push({ severity: "error", code: "PAYLOAD_NOT_CANONICAL", seq: c.seq, message: `Record #${c.seq} payload is not in canonical form (re-serialised or edited)` });
-      const digest = payloadDigest(r.payload);
-      if (digest !== c.payloadDigest)
-        findings.push({ severity: "error", code: "PAYLOAD_DIGEST_MISMATCH", seq: c.seq, message: `Record #${c.seq} off-chain payload does not match the digest committed on-chain — the stored details were altered` });
-      if (r.payload_digest !== c.payloadDigest)
-        findings.push({ severity: "warning", code: "STORED_DIGEST_MISMATCH", seq: c.seq, message: `Record #${c.seq} stored digest column differs from on-chain commitment` });
-      if (r.record_hash !== c.recordHash)
-        findings.push({ severity: "error", code: "RECORD_HASH_MISMATCH", seq: c.seq, message: `Record #${c.seq} stored record hash differs from on-chain` });
-      if (r.actor_address.toLowerCase() !== c.actor.toLowerCase())
-        findings.push({ severity: "error", code: "ACTOR_MISMATCH", seq: c.seq, message: `Record #${c.seq} attributes a different actor off-chain than on-chain` });
-      if (typeName(c.recordType) !== r.type)
-        findings.push({ severity: "error", code: "TYPE_MISMATCH", seq: c.seq, message: `Record #${c.seq} type differs between database (${r.type}) and chain (${typeName(c.recordType)})` });
-      const refOn = c.refSeq === NO_REF ? null : c.refSeq;
-      if (refOn !== r.ref_seq) findings.push({ severity: "error", code: "REFERENCE_MISMATCH", seq: c.seq, message: `Record #${c.seq} reference differs between database and chain` });
-      if (c.outcome !== r.outcome) findings.push({ severity: "error", code: "OUTCOME_MISMATCH", seq: c.seq, message: `Record #${c.seq} resolution outcome differs between database and chain` });
-
-      // 3. evidence committed in this payload
-      for (const ev of ((parsed as any).evidence ?? []) as { id: string; sha256: string }[]) {
-        report.evidenceChecked++;
-        const row = this.store.getEvidence(ev.id);
-        if (!row) {
-          findings.push({ severity: "error", code: "EVIDENCE_ROW_MISSING", seq: c.seq, evidenceId: ev.id, message: `Evidence ${ev.id} committed in #${c.seq} has no database row` });
-          continue;
-        }
-        if (row.sha256 !== ev.sha256)
-          findings.push({ severity: "error", code: "EVIDENCE_DIGEST_EDITED", seq: c.seq, evidenceId: ev.id, message: `Evidence ${ev.id}: database digest differs from the digest committed in #${c.seq}` });
-        const chk = this.vault.verify(row.stored_name, ev.sha256);
-        if (chk.status === "missing") findings.push({ severity: "error", code: "EVIDENCE_FILE_MISSING", seq: c.seq, evidenceId: ev.id, message: `Evidence ${ev.id} file is missing` });
-        else if (chk.status === "mismatch")
-          findings.push({ severity: "error", code: "EVIDENCE_FILE_ALTERED", seq: c.seq, evidenceId: ev.id, message: `Evidence ${ev.id} file no longer matches the SHA-256 committed in #${c.seq}` });
-        const reuse = this.store.evidenceBySha(row.sha256).filter((o) => o.id !== row.id);
-        if (reuse.length)
-          findings.push({ severity: "warning", code: "EVIDENCE_DIGEST_REUSED", seq: c.seq, evidenceId: ev.id, message: `Evidence ${ev.id} is byte-identical to ${reuse.map((o) => `${o.id} (${o.public_id})`).join(", ")}` });
-      }
-    }
-    for (const r of rows) {
-      if (r.seq >= recs.length)
-        findings.push({ severity: "error", code: "UNANCHORED_RECORD", seq: r.seq, message: `Database record #${r.seq} has no on-chain commitment (inserted outside the ledger)` });
-    }
-    // 4. device metadata vs registration payload
-    const reg = bySeq.get(0);
-    if (reg) {
-      try {
-        const p = JSON.parse(reg.payload);
-        if (p.brand !== device.brand || p.model !== device.model)
-          findings.push({ severity: "error", code: "DEVICE_METADATA_EDITED", seq: 0, message: "Device brand/model in the database differ from the registered (committed) values" });
-      } catch {
-        /* reported above */
-      }
-    }
-    report.ok = !findings.some((f) => f.severity === "error");
-    return report;
+  auditEvents(limit = 200) {
+    return this.store.all("SELECT * FROM chain_events ORDER BY seq DESC LIMIT ?", limit).map((e) => this.eventView(e));
   }
 
-  async checkAll() {
-    const out = [];
-    for (const d of this.store.listDevices()) out.push(await this.checkIntegrity(d.public_id));
-    return { checkedAt: nowIso(), devices: out.length, ok: out.every((r) => r.ok), reports: out };
+  accessLog(viewer: Viewer, limit = 100) {
+    if (viewer.kind !== "auditor" && viewer.kind !== "governor") throw new ServiceError("The access log is visible to auditors.", 403);
+    return this.store.all("SELECT * FROM access_log ORDER BY id DESC LIMIT ?", limit);
   }
 
-  // -- export ----------------------------------------------------------------
-  async exportHistory(publicId: string) {
-    const device = this.requireDevice(publicId);
-    const rows = this.store.listEvents(publicId);
-    const integrity = await this.checkIntegrity(publicId);
-    const evIds = new Set<string>();
-    for (const r of rows) for (const e of JSON.parse(r.payload).evidence ?? []) evIds.add(e.id);
-    return {
-      format: "patchledger.export.v1",
-      generatedAt: nowIso(),
-      notice: "Synthetic research prototype data. A valid hash chain shows the history was not altered after recording; it does not prove the recorded claims are true.",
-      hashSpec: {
-        payloadDigest: "keccak256(utf8(canonicalPayload)); canonical = sorted keys, no whitespace, NFC strings, integer-only numbers",
-        recordHash:
-          "keccak256(abi.encode(keccak256('PatchLedger.Record.v1'), chainId, contract, deviceKey, seq:uint32, recordType:uint8, prevHash, payloadDigest, actor, timestamp:uint40, refSeq:uint32, outcome:uint8))",
-        deviceKey: "keccak256(utf8('patchledger:device:' + publicId))",
-        evidenceDigest: "SHA-256 over raw file bytes (hex)",
-        noRef: NO_REF,
-      },
-      chain: { chainId: this.ledger.chainId, contract: this.ledger.address, network: "local Hardhat development chain (not a public network)" },
-      device: { publicId, deviceKey: device.device_key, brand: device.brand, model: device.model, year: device.year, formFactor: device.form_factor, synthetic: !!device.synthetic },
-      headHash: rows.length ? rows[rows.length - 1].record_hash : null,
-      records: rows.map((r) => ({
-        seq: r.seq,
-        type: r.type,
-        recordType: typeCode(r.type as RecordType),
-        refSeq: r.ref_seq === null ? NO_REF : r.ref_seq,
-        outcome: r.outcome,
-        actor: r.actor_address,
-        actorLabel: this.identityByAddress(r.actor_address).label,
-        timestamp: r.chain_ts,
-        recordedAt: new Date(r.chain_ts * 1000).toISOString(),
-        prevHash: r.prev_hash,
-        recordHash: r.record_hash,
-        payloadDigest: r.payload_digest,
-        canonicalPayload: r.payload,
-        txHash: r.tx_hash,
-        blockNumber: r.block_number,
-      })),
-      evidence: [...evIds].map((id) => {
-        const e = this.store.getEvidence(id);
-        return e ? { id, kind: e.kind, sha256: e.sha256, size: e.size, mime: e.mime, storedName: e.stored_name } : { id, missing: true };
+  async programs() {
+    return Promise.all(
+      PROGRAMS.map(async (p) => {
+        const onchain = await this.ledger.read("programs", p.id);
+        const policies = this.store.all("SELECT version, digest, body, published_at FROM policies WHERE program_id = ? ORDER BY version", p.id);
+        return { ...p, active: Boolean(onchain.active), policyVersion: Number(onchain.policyVersion), policies };
       }),
-      verification: integrity,
-    };
+    );
   }
 
-  async verificationReport(publicId: string): Promise<string> {
-    const x = await this.exportHistory(publicId);
-    const passport = await this.getPassport(publicId);
-    const v = x.verification;
-    const lines: string[] = [];
-    lines.push(`# PatchLedger verification report — ${x.device.publicId}`);
-    lines.push("");
-    lines.push(`Generated: ${x.generatedAt}  `);
-    lines.push(`Device: ${x.device.brand} ${x.device.model}${x.device.year ? ` (${x.device.year})` : ""}${x.device.synthetic ? " — SYNTHETIC DEMO RECORD" : ""}  `);
-    lines.push(`Device key: \`${x.device.deviceKey}\`  `);
-    lines.push(`Contract: \`${x.chain.contract}\` on chain ${x.chain.chainId} (${x.chain.network})  `);
-    lines.push(`Head hash: \`${x.headHash}\``);
-    lines.push("");
-    lines.push(`> ${x.notice}`);
-    lines.push("");
-    lines.push(`## Verdict: ${v.ok ? "PASS — off-chain history matches on-chain commitments" : "FAIL — integrity findings below"}`);
-    lines.push("");
-    lines.push(`- On-chain records: ${v.chain.onChainRecords}; off-chain records: ${v.chain.offChainRecords}`);
-    lines.push(`- Contract verifyChain(): ${v.chain.contractVerifyChain}`);
-    lines.push(`- Evidence commitments checked: ${v.evidenceChecked}`);
-    lines.push(`- Open disputes: ${passport.openDisputes}; open component conflicts: ${passport.conflicts.filter((c) => c.status === "open").length}`);
-    lines.push("");
-    lines.push("## Findings");
-    lines.push("");
-    if (!v.findings.length) lines.push("No findings.");
-    for (const f of v.findings) lines.push(`- **${f.severity.toUpperCase()}** \`${f.code}\`${f.seq !== undefined ? ` (record #${f.seq})` : ""}: ${f.message}`);
-    lines.push("");
-    lines.push("## Event sequence");
-    lines.push("");
-    lines.push("| # | Type | Actor | Recorded (chain time) | Ref | Evidence status | Record hash | Payload digest |");
-    lines.push("|---|------|-------|-----------------------|-----|-----------------|-------------|----------------|");
-    for (const e of passport.events) {
-      lines.push(
-        `| ${e.seq} | ${e.typeLabel}${e.type === "RESOLUTION" ? ` — ${e.outcomeLabel}` : ""} | ${e.actor.label} | ${e.recordedAt} | ${e.refSeq ?? ""} | ${e.categoryLabel} | \`${e.recordHash}\` | \`${e.payloadDigest}\` |`,
-      );
-    }
-    lines.push("");
-    lines.push("## Evidence digests (SHA-256)");
-    lines.push("");
-    lines.push("| Evidence | Kind | Committed in | SHA-256 | Integrity |");
-    lines.push("|----------|------|--------------|---------|-----------|");
-    for (const e of passport.events.flatMap((ev) => ev.evidence.filter((x) => x.committedInSeq === ev.seq)))
-      lines.push(`| ${e.id} | ${e.kind} | #${e.committedInSeq} | \`${e.sha256}\` | ${e.integrity} |`);
-    if (passport.conflicts.length) {
-      lines.push("");
-      lines.push("## Conflicting claims");
-      lines.push("");
-      for (const c of passport.conflicts) lines.push(`- ${c.component}: replacement in #${c.replacedSeq} vs. "original" asserted in #${c.assertedOriginalSeq} — ${c.status} (${c.note})`);
-    }
-    lines.push("");
-    lines.push("## How to re-verify independently");
-    lines.push("");
-    lines.push("Export the JSON history and run `npm run verify-export -- <file.json> [--rpc http://127.0.0.1:8545]`. The script recomputes every payload digest and record hash without using the PatchLedger server.");
-    return lines.join("\n") + "\n";
+  /** Verify a receipt (and optionally a reveal package) against the chain — no login needed. */
+  verifyReceipt(receipt: unknown, reveal?: unknown) {
+    return verifyReceipt(receipt, this.ledger.provider, reveal);
   }
-}
-
-/** Component lineage check: a component asserted "original" after a recorded replacement. */
-export function detectConflicts(events: EventView[]): Conflict[] {
-  const conflicts: Conflict[] = [];
-  // all earlier replacement claims per component, in order
-  const replaced = new Map<string, number[]>();
-  const inactive = (seq: number) => {
-    const e = events[seq];
-    return !!e && (e.supersededBySeq !== null || e.challenges.some((c) => c.outcome === "CLAIM_REJECTED"));
-  };
-  for (const e of events) {
-    if (!isClaimType(e.type)) continue;
-    const assertions: { component: string; state: string }[] = [
-      ...((e.payload.componentAssertions ?? []) as { component: string; state: string }[]),
-      ...((e.payload.corrected?.componentAssertions ?? []) as { component: string; state: string }[]),
-    ];
-    for (const a of assertions) {
-      if (a.state === "replaced") replaced.set(a.component, [...(replaced.get(a.component) ?? []), e.seq]);
-      const prior = replaced.get(a.component) ?? [];
-      if (a.state === "original" && prior.length) {
-        // compare with the latest replacement that still stands; fall back to the latest one overall
-        const active = prior.filter((s) => !inactive(s));
-        const r = active.length ? active[active.length - 1] : prior[prior.length - 1];
-        const addressed = inactive(r) || inactive(e.seq);
-        conflicts.push({
-          component: a.component,
-          replacedSeq: r,
-          assertedOriginalSeq: e.seq,
-          status: addressed ? "addressed" : "open",
-          note: addressed
-            ? "one side has since been corrected or rejected by an auditor; both records remain in the history"
-            : "a later record asserts the original part although an earlier record claims it was replaced",
-        });
-      }
-    }
-  }
-  return conflicts;
 }
 
 export { LedgerError };

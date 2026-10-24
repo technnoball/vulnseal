@@ -1145,3 +1145,244 @@ pre.log {
 .matrix td:first-child {
   min-width: 240px;
 }
+
+/* ===================================================== VulnSeal additions */
+
+/* confidential (sealed) vs consortium-visible (ledger) panels */
+.sealed {
+  border: 1px solid var(--umber);
+  border-left: 6px double var(--brass);
+  background: var(--paper-hi);
+  margin-bottom: var(--s5);
+}
+.sealed-head,
+.ledger-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 8px var(--s4);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.sealed-head {
+  background: var(--umber);
+  color: var(--bone);
+}
+.sealed-tag,
+.ledger-tag {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  opacity: 0.85;
+}
+.sealed-reason {
+  margin: 0;
+  padding: var(--s2) var(--s4);
+  font-size: 12.5px;
+  color: var(--brass-ink);
+  border-bottom: 1px dashed var(--putty);
+}
+.sealed-body {
+  padding: var(--s3) var(--s4) var(--s4);
+  display: grid;
+  gap: var(--s3);
+}
+.sealed.withheld {
+  border-left-style: solid;
+  border-left-color: var(--slate);
+  background: var(--paper-lo);
+}
+.sealed.withheld .sealed-head {
+  background: var(--slate);
+}
+.sealed.withheld .sealed-reason {
+  border-bottom: 0;
+  color: var(--ink-soft);
+  padding-bottom: var(--s3);
+}
+.ledger-panel {
+  border: 1px solid var(--slate);
+  background: var(--bone);
+  margin-bottom: var(--s5);
+}
+.ledger-head {
+  background: var(--slate);
+  color: var(--putty);
+}
+.ledger-body {
+  padding: var(--s3) var(--s4) var(--s4);
+}
+.field-block .label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin-bottom: 2px;
+}
+.field-block p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* state stamps */
+.stamp.st-pending {
+  color: var(--ink-soft);
+  border-style: dashed;
+}
+.stamp.st-progress {
+  color: var(--brass-ink);
+  background: #efe5cf;
+}
+.stamp.st-verified {
+  color: #1f1a17;
+  background: var(--lichen);
+  border-color: var(--lichen-ink);
+}
+.stamp.st-strong {
+  color: var(--paper-hi);
+  background: var(--lichen-ink);
+  border-color: var(--lichen-ink);
+}
+.stamp.st-disputed {
+  color: var(--paper-hi);
+  background: var(--vermilion-deep);
+  border-color: var(--vermilion-deep);
+}
+.stamp.st-failed {
+  color: var(--vermilion-ink);
+  border-style: double;
+  border-width: 3px;
+}
+.stamp.st-final {
+  color: var(--bone);
+  background: var(--umber);
+  border-color: var(--umber);
+}
+.stamp.st-muted {
+  color: var(--paper-hi);
+  background: var(--slate);
+  border-color: var(--slate);
+}
+
+/* verification checklist */
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+.check.ok {
+  color: var(--lichen-ink);
+}
+.check.bad {
+  color: var(--vermilion-ink);
+  font-weight: 500;
+}
+.check.warn {
+  color: var(--brass-ink);
+}
+ul.checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+ul.checklist li {
+  display: grid;
+  grid-template-columns: minmax(150px, 220px) 1fr;
+  gap: var(--s3);
+  font-size: 13px;
+  border-bottom: 1px dotted var(--putty);
+  padding: 3px 0;
+}
+
+/* icon alignment inside buttons and nav */
+.btn svg,
+.rail nav a svg {
+  flex: none;
+}
+.rail nav a {
+  grid-template-columns: 30px 1fr;
+}
+.rail nav a .ico {
+  color: var(--brass);
+  display: inline-flex;
+}
+.role-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid var(--umber);
+  white-space: nowrap;
+}
+.sim-tag {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--vermilion-ink);
+  border: 1px dashed var(--vermilion-ink);
+  padding: 1px 5px;
+}
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: step;
+}
+.steps > li {
+  border-left: 2px solid var(--putty);
+  padding: 0 0 var(--s4) var(--s5);
+  position: relative;
+}
+.steps > li::before {
+  counter-increment: step;
+  content: counter(step, decimal-leading-zero);
+  position: absolute;
+  left: -16px;
+  top: 0;
+  width: 30px;
+  height: 22px;
+  background: var(--bone);
+  border: 1.5px solid var(--putty);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: center;
+  line-height: 19px;
+}
+.steps > li.done {
+  border-left-color: var(--lichen-ink);
+}
+.steps > li.done::before {
+  border-color: var(--lichen-ink);
+  background: var(--lichen);
+}
+.steps > li.next::before {
+  border-color: var(--vermilion);
+  color: var(--vermilion-ink);
+}
+.steps .step-title {
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+.act {
+  font-size: 13px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px;
+  padding: 2px 0;
+}
+.radio-line {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 6px;
+}
+.radio-line input {
+  margin-top: 3px;
+  flex: none;
+}

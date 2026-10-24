@@ -103,6 +103,10 @@ CREATE TABLE IF NOT EXISTS access_log (
   object TEXT NOT NULL, allowed INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS identity_private (
+  identity_id TEXT PRIMARY KEY, sealed BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS lab_backups (
   id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, target TEXT NOT NULL, json TEXT, data BLOB,
   created_at TEXT NOT NULL

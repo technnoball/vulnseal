@@ -1,22 +1,24 @@
-// HTTP API and static frontend. Demo identity is selected with the
-// X-Demo-Actor header — a demonstration convenience, NOT authentication.
+// HTTP API and static frontend. The demo identity comes from an HMAC-signed session
+// cookie (a simulated sign-in, not authentication). Every confidential route resolves
+// the viewer server-side and goes through the service's access checks.
 import fs from "node:fs";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import express, { type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
-import QRCode from "qrcode";
+import { keccak256, toUtf8Bytes } from "ethers";
 import { LedgerError } from "./chain.ts";
 import { ROOT, type AppConfig } from "./config.ts";
-import { COMPONENTS, EVIDENCE_KINDS, IDENTITIES, RECORD_TYPE_LABEL } from "./domain.ts";
-import { MAX_EVIDENCE_BYTES } from "./evidence.ts";
+import { DECISION_NAMES, DECISIONS_FOR_KIND, DISPUTE_KIND_NAMES, IDENTITY_DEFS, LOG_KINDS, PROGRAMS, REASON_CODES, RELATION_NAMES, SEVERITIES, STATUS } from "./domain.ts";
+import { auditReport, verifyAuditExport } from "./integrity.ts";
 import { TamperLab } from "./lab.ts";
-import { CATEGORIES, CATEGORY_LABEL, FORM_FACTORS, PART_ORIGINS, PatchLedgerService, RESULTS, ServiceError } from "./service.ts";
+import { MAX_EVIDENCE, ServiceError, type VulnSealService } from "./service.ts";
+import { SESSION_COOKIE, readCookie, type Sessions } from "./session.ts";
+import { DemoRunner } from "./demo.ts";
 
-const actorOf = (req: Request) => (req.header("x-demo-actor") ?? undefined) || undefined;
-const seqParam = (v: unknown) => {
+const num = (v: unknown, name = "id") => {
   const n = Number(v);
-  if (!Number.isInteger(n) || n < 0) throw new ServiceError("seq must be a non-negative integer", 422);
+  if (!Number.isInteger(n) || n < 1) throw new ServiceError(`${name} must be a positive integer`, 422);
   return n;
 };
 
@@ -25,14 +27,15 @@ interface BenchState {
   startedAt: string | null;
   finishedAt: string | null;
   exitCode: number | null;
-  params: { devices: number; events: number; seed: number } | null;
+  params: Record<string, number> | null;
   log: string;
 }
 
-export function createApp(svc: PatchLedgerService, cfg: AppConfig) {
+export function createApp(svc: VulnSealService, sessions: Sessions, cfg: AppConfig) {
   const app = express();
   const lab = new TamperLab(svc);
-  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_EVIDENCE_BYTES, files: 1 } });
+  const demo = new DemoRunner(svc);
+  const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_EVIDENCE, files: 1 } });
   const bench: BenchState = { running: false, startedAt: null, finishedAt: null, exitCode: null, params: null, log: "" };
   let benchProc: ChildProcess | null = null;
 
@@ -41,105 +44,174 @@ export function createApp(svc: PatchLedgerService, cfg: AppConfig) {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    res.setHeader("Cache-Control", "no-store");
     next();
   });
-  app.use(express.json({ limit: "256kb" }));
+  app.use(express.json({ limit: "512kb" }));
+
+  const viewerOf = (req: Request) => svc.viewer(sessions.verify(readCookie(req.headers.cookie, SESSION_COOKIE)));
+  const me = (req: Request) => svc.requireViewer(sessions.verify(readCookie(req.headers.cookie, SESSION_COOKIE)));
+  const download = (res: Response, name: string, body: unknown) => {
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    res.type("application/json").send(JSON.stringify(body, null, 2));
+  };
 
   const api = express.Router();
 
+  // ----------------------------------------------------------------- basics
   api.get("/health", async (_req, res) => {
     try {
-      const p = await svc.ledger.ping();
-      res.json({ ok: true, api: "up", chain: { ok: true, ...p, contract: svc.ledger.address, chainId: svc.ledger.chainId, rpcUrl: svc.ledger.rpcUrl } });
+      const block = await svc.ledger.ping();
+      res.json({ ok: true, chain: { ok: true, blockNumber: block, contract: svc.ledger.address, chainId: svc.ledger.chainId, rpcUrl: svc.ledger.rpcUrl } });
     } catch (e) {
-      res.status(503).json({ ok: false, api: "up", chain: { ok: false, error: (e as Error).message, rpcUrl: svc.ledger.rpcUrl } });
+      res.status(503).json({ ok: false, chain: { ok: false, error: (e as Error).message, rpcUrl: svc.ledger.rpcUrl } });
     }
   });
 
   api.get("/meta", (_req, res) => {
     res.json({
-      identities: IDENTITIES.map((i) => ({ ...i, address: svc.ledger.addressOf(i.id) })),
-      recordTypes: RECORD_TYPE_LABEL,
-      categories: CATEGORIES,
-      results: RESULTS,
-      components: COMPONENTS,
-      partOrigins: PART_ORIGINS,
-      formFactors: FORM_FACTORS,
-      evidenceKinds: EVIDENCE_KINDS,
-      evidenceCategories: CATEGORY_LABEL,
+      identities: svc.identities(),
+      programs: PROGRAMS,
+      statuses: STATUS,
+      relations: RELATION_NAMES,
+      disputeKinds: DISPUTE_KIND_NAMES,
+      decisions: DECISION_NAMES,
+      decisionsForKind: DECISIONS_FOR_KIND,
+      reasonCodes: REASON_CODES,
+      logKinds: LOG_KINDS,
+      severities: SEVERITIES,
       demoLab: cfg.demoLab,
-      publicBaseUrl: cfg.publicBaseUrl,
+      simulatedAuth: true,
     });
   });
 
-  api.get("/identities", async (_req, res) => res.json(await svc.identities()));
+  api.get("/session", (req, res) => res.json({ identity: viewerOf(req) ?? null }));
+  api.post("/session", (req, res) => {
+    const id = String(req.body?.identityId ?? "");
+    if (!IDENTITY_DEFS.some((d) => d.id === id)) throw new ServiceError("Unknown demo identity", 422);
+    res.setHeader("Set-Cookie", `${SESSION_COOKIE}=${encodeURIComponent(sessions.issue(id))}; Path=/; HttpOnly; SameSite=Strict`);
+    res.json({ identity: svc.viewer(id) });
+  });
+  api.delete("/session", (_req, res) => {
+    res.setHeader("Set-Cookie", `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
+    res.json({ identity: null });
+  });
+
   api.get("/dashboard", async (_req, res) => res.json(await svc.dashboard()));
-  api.get("/devices", (_req, res) => res.json(svc.listDevices()));
-  api.post("/devices", async (req, res) => res.status(201).json(await svc.registerDevice(actorOf(req), req.body ?? {})));
-  api.get("/devices/:id", async (req, res) => res.json(await svc.getPassport(req.params.id, actorOf(req))));
-  api.get("/devices/:id/qr.svg", async (req, res) => {
-    svc.store.getDevice(req.params.id) ?? (() => { throw new ServiceError("Device not found", 404); })();
-    const url = `${cfg.publicBaseUrl}/verify/${encodeURIComponent(req.params.id)}`;
-    const svg = await QRCode.toString(url, { type: "svg", margin: 1, color: { dark: "#332A26", light: "#E9E1D2" } });
-    res.type("image/svg+xml").send(svg);
-  });
-  api.post("/devices/:id/evidence", upload.single("file"), (req, res) => {
+  api.get("/explorer", async (_req, res) => res.json(await svc.explorer()));
+  api.get("/programs", async (_req, res) => res.json(await svc.programs()));
+  api.get("/events", (req, res) => res.json(svc.auditEvents(Math.min(500, Number(req.query.limit ?? 200)))));
+
+  // ------------------------------------------------------------- researcher
+  api.get("/me/reports", async (req, res) => res.json(await svc.myReports(me(req))));
+  api.post("/evidence", upload.single("file"), (req, res) => {
     const f = req.file;
-    res.status(201).json(
-      svc.uploadEvidence(actorOf(req), String(req.params.id), f ? { buffer: f.buffer, originalname: f.originalname, mimetype: f.mimetype } : undefined, req.body ?? {}),
-    );
+    res.status(201).json(svc.uploadEvidence(me(req), f ? { buffer: f.buffer, originalname: f.originalname, mimetype: f.mimetype } : undefined));
   });
-  api.post("/devices/:id/events", async (req, res) => res.status(201).json(await svc.appendEvent(actorOf(req), req.params.id, req.body ?? {})));
-  api.get("/devices/:id/integrity", async (req, res) => res.json(await svc.checkIntegrity(req.params.id)));
-  api.get("/devices/:id/export", async (req, res) => {
-    const x = await svc.exportHistory(req.params.id);
-    res.setHeader("Content-Disposition", `attachment; filename="patchledger-${req.params.id}-history.json"`);
-    res.type("application/json").send(JSON.stringify(x, null, 2));
-  });
-  api.get("/devices/:id/report", async (req, res) => {
-    const md = await svc.verificationReport(req.params.id);
-    res.setHeader("Content-Disposition", `attachment; filename="patchledger-${req.params.id}-verification.md"`);
-    res.type("text/markdown").send(md);
-  });
-
-  api.get("/public/devices/:id", async (req, res) => res.json(await svc.getPublicView(req.params.id)));
-
-  api.get("/evidence/:id", (req, res) => res.json(svc.getEvidenceDetail(req.params.id, actorOf(req))));
-  api.get("/evidence/:id/file", (req, res) => {
-    // identity can come from a query parameter so <img>/<iframe> can load it
-    const viewer = actorOf(req) ?? (typeof req.query.as === "string" ? req.query.as : undefined);
-    const f = svc.evidenceFile(req.params.id, viewer);
+  api.get("/evidence/:id", async (req, res) => {
+    const f = await svc.evidenceFile(me(req), String(req.params.id));
     res.setHeader("Content-Type", f.mime);
-    res.setHeader("Content-Disposition", `${req.query.download ? "attachment" : "inline"}; filename="${f.filename.replace(/"/g, "")}"`);
-    res.setHeader("Cache-Control", "no-store");
-    // user-supplied SVG/text must never run script in our origin
-    if (f.mime === "image/svg+xml" || f.mime.startsWith("text/")) res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:");
-    res.sendFile(f.path);
+    res.setHeader("Content-Disposition", `attachment; filename="${String(f.filename).replace(/"/g, "")}"`);
+    res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'");
+    res.send(f.data);
   });
-  api.post("/evidence/:id/verify", async (req, res) => res.json(await svc.verifyEvidenceOnChain(req.params.id)));
+  api.post("/reports", async (req, res) => res.status(201).json(await svc.commitReport(me(req), req.body ?? {})));
+  api.get("/reports/:cid", async (req, res) => res.json(await svc.reportView(me(req), num(req.params.cid))));
+  api.post("/reports/:cid/revise", async (req, res) => res.status(201).json(await svc.reviseReport(me(req), num(req.params.cid), req.body ?? {})));
+  api.get("/reports/:cid/receipt", async (req, res) => {
+    const r = await svc.receipt(me(req), num(req.params.cid));
+    download(res, `vulnseal-receipt-${r.reportRef}.json`, r);
+  });
+  api.get("/reports/:cid/recovery", async (req, res) => {
+    const p = await svc.recoveryPackage(me(req), num(req.params.cid));
+    download(res, `vulnseal-PRIVATE-reveal-package-${p.receipt.reportRef}.json`, p);
+  });
+  api.post("/reports/:cid/reveal", async (req, res) => res.status(201).json(await svc.submitReveal(me(req), num(req.params.cid), req.body ?? {})));
 
+  // ---------------------------------------------------------------- program
+  api.get("/program/inbox", async (req, res) => res.json(await svc.programInbox(me(req))));
+  api.post("/reports/:cid/acknowledge", async (req, res) => res.json(await svc.acknowledge(me(req), num(req.params.cid))));
+  api.post("/reports/:cid/request-reveal", async (req, res) => res.json(await svc.requestReveal(me(req), num(req.params.cid))));
+  api.post("/reveals/:id/verify", async (req, res) => res.json(await svc.verifyReveal(me(req), num(req.params.id))));
+  api.post("/reports/:cid/triage", async (req, res) => res.json(await svc.triage(me(req), num(req.params.cid), String(req.body?.target ?? ""), String(req.body?.note ?? ""))));
+  api.post("/reports/:cid/notes", (req, res) => res.status(201).json(svc.addNote(me(req), num(req.params.cid), String(req.body?.body ?? ""))));
+  api.post("/reports/:cid/grant", async (req, res) => res.json(await svc.grantDisclosure(me(req), num(req.params.cid), num(req.body?.toProgram, "toProgram"))));
+  api.post("/reports/:cid/finalize", async (req, res) => res.json(await svc.finalizeReport(me(req), num(req.params.cid), String(req.body?.note ?? ""))));
+
+  // ----------------------------------------------------------- associations
+  api.post("/associations", async (req, res) => {
+    const b = req.body ?? {};
+    res.status(201).json(await svc.proposeAssociation(me(req), num(b.cidA, "cidA"), num(b.cidB, "cidB"), num(b.relation, "relation"), String(b.rationale ?? "")));
+  });
+  api.get("/associations/:aid", async (req, res) => res.json(await svc.associationView(me(req), num(req.params.aid))));
+  api.post("/associations/:aid/review", async (req, res) =>
+    res.json(await svc.reviewAssociation(me(req), num(req.params.aid), req.body?.approve === true, String(req.body?.rationale ?? ""))),
+  );
+
+  // --------------------------------------------------------------- disputes
   api.get("/disputes", async (_req, res) => res.json(await svc.disputes()));
-  api.get("/integrity", async (_req, res) => res.json(await svc.checkAll()));
+  api.post("/disputes", async (req, res) => {
+    const b = req.body ?? {};
+    res.status(201).json(await svc.openDispute(me(req), num(b.kind, "kind"), num(b.subject, "subject"), String(b.statement ?? "")));
+  });
+  api.get("/disputes/:did", async (req, res) => res.json(await svc.disputeView(me(req), num(req.params.did))));
+  api.post("/disputes/:did/vote", async (req, res) => {
+    const b = req.body ?? {};
+    res.json(await svc.vote(me(req), num(req.params.did), num(b.decision, "decision"), num(b.reasonCode, "reasonCode"), String(b.rationale ?? "")));
+  });
+  api.post("/disputes/:did/recuse", async (req, res) => res.json(await svc.recuse(me(req), num(req.params.did))));
+  api.post("/disputes/:did/appeal", async (req, res) => res.json(await svc.appeal(me(req), num(req.params.did), String(req.body?.statement ?? ""))));
+  api.post("/disputes/:did/close", async (req, res) => res.json(await svc.closeDispute(me(req), num(req.params.did))));
 
-  // --- tamper lab (attack simulation) -------------------------------------
-  const labGuard = (_req: Request, _res: Response, next: NextFunction) => {
-    if (!cfg.demoLab) throw new ServiceError("The tamper lab is disabled (PL_DEMO_LAB=0)", 403);
+  // ---------------------------------------------------------- verification
+  api.post("/verify/receipt", async (req, res) => res.json(await svc.verifyReceipt(req.body?.receipt, req.body?.reveal)));
+
+  const auditor = (req: Request) => {
+    const v = me(req);
+    if (v.kind !== "auditor" && v.kind !== "governor") throw new ServiceError("The audit report is available to the consortium auditor.", 403);
+    return v;
+  };
+  api.get("/audit/report", async (req, res) => {
+    auditor(req);
+    const r = await auditReport(svc);
+    res.json({ ...r, log: r.log.slice(-60), logTotal: r.log.length });
+  });
+  api.get("/audit/export", async (req, res) => {
+    auditor(req);
+    download(res, `vulnseal-audit-${new Date().toISOString().replace(/[:.]/g, "-")}.json`, await auditReport(svc));
+  });
+  api.post("/audit/verify-export", (req, res) => res.json(verifyAuditExport(req.body)));
+  api.post("/audit/attest", async (req, res) => {
+    const v = auditor(req);
+    const r = await auditReport(svc);
+    const digest = keccak256(toUtf8Bytes(JSON.stringify({ head: r.chain.logHead, count: r.chain.logCount, ok: r.ok, findings: r.findings.map((f) => f.code) })));
+    const tx = await svc.tx(v.id, "attest", [digest]);
+    res.json({ tx: tx.hash, digest, ok: r.ok, logCount: r.chain.logCount });
+  });
+  api.get("/access-log", (req, res) => res.json(svc.accessLog(me(req))));
+
+  // ------------------------------------------------------------ tamper lab
+  const labGuard = (req: Request, _res: Response, next: NextFunction) => {
+    if (!cfg.demoLab) throw new ServiceError("The tamper lab is disabled (VS_DEMO_LAB=0)", 403);
+    const v = me(req);
+    if (v.kind !== "auditor" && v.kind !== "governor") throw new ServiceError("The tamper lab is run from the auditor identity.", 403);
     next();
   };
   api.get("/lab/state", labGuard, (_req, res) => res.json(lab.state()));
-  api.post("/lab/edit-record", labGuard, (req, res) => res.json(lab.editRecord(String(req.body.publicId), seqParam(req.body.seq))));
-  api.post("/lab/delete-record", labGuard, (req, res) => res.json(lab.deleteRecord(String(req.body.publicId), seqParam(req.body.seq))));
-  api.post("/lab/alter-evidence", labGuard, (req, res) =>
-    res.json(lab.alterEvidence(String(req.body.evidenceId), req.body.mode === "file-and-db" ? "file-and-db" : "file")),
-  );
+  api.post("/lab/alter-reveal", labGuard, (req, res) => res.json(lab.alterReveal(num(req.body?.revealId, "revealId"))));
+  api.post("/lab/alter-commitment", labGuard, (req, res) => res.json(lab.alterCommitment(num(req.body?.cid, "cid"))));
+  api.post("/lab/delete-event", labGuard, (req, res) => res.json(lab.deleteEvent(num(req.body?.seq, "seq"))));
+  api.post("/lab/alter-evidence", labGuard, (req, res) => res.json(lab.alterEvidence(String(req.body?.evidenceId ?? ""))));
+  api.post("/lab/alter-rationale", labGuard, (req, res) => res.json(lab.alterRationale(num(req.body?.aid, "aid"))));
+  api.post("/lab/chain-attempts", labGuard, async (req, res) => res.json(await lab.chainAttempts(num(req.body?.cid, "cid"))));
   api.post("/lab/restore", labGuard, (_req, res) => res.json(lab.restoreAll()));
-  api.post("/lab/chain-attempts", labGuard, async (req, res) => {
-    const actor = actorOf(req);
-    if (!actor) throw new ServiceError("Select a demonstration identity first", 401);
-    res.json(await lab.chainAttempts(actor, String(req.body.publicId), seqParam(req.body.seq)));
-  });
 
-  // --- benchmark ------------------------------------------------------------
+  // ------------------------------------------------------------- demo mode
+  api.get("/demo", (_req, res) => res.json(demo.state()));
+  api.post("/demo/step", async (req, res) => res.json(await demo.runNext(viewerOf(req))));
+  api.post("/demo/reset", (_req, res) => res.json(demo.reset()));
+
+  // ------------------------------------------------------------- benchmark
   api.get("/benchmark/latest", (_req, res) => {
     const p = path.join(cfg.resultsDir, "latest.json");
     if (!fs.existsSync(p)) throw new ServiceError("No benchmark results yet. Run one from this page or with npm run benchmark.", 404);
@@ -153,21 +225,16 @@ export function createApp(svc: PatchLedgerService, cfg: AppConfig) {
   api.get("/benchmark/status", (_req, res) => res.json(bench));
   api.post("/benchmark/run", (req, res) => {
     if (bench.running) throw new ServiceError("A benchmark is already running", 409);
-    const devices = Number(req.body?.devices ?? 10);
-    const events = Number(req.body?.events ?? 8);
-    const seed = Number(req.body?.seed ?? 42);
-    for (const [k, v, max] of [["devices", devices, 200], ["events", events, 60], ["seed", seed, 2 ** 31]] as const) {
+    const params = { reports: Number(req.body?.reports ?? 40), seed: Number(req.body?.seed ?? 42), trials: Number(req.body?.trials ?? 10) };
+    for (const [k, v, max] of [["reports", params.reports, 400], ["seed", params.seed, 2 ** 31], ["trials", params.trials, 50]] as const) {
       if (!Number.isInteger(v) || v < 1 || v > max) throw new ServiceError(`${k} must be an integer between 1 and ${max}`, 422);
     }
-    if (devices * events > 3000) throw new ServiceError("devices × events is limited to 3000 from the UI; use the CLI for larger runs", 422);
-    Object.assign(bench, { running: true, startedAt: new Date().toISOString(), finishedAt: null, exitCode: null, params: { devices, events, seed }, log: "" });
-    benchProc = spawn(process.execPath, ["scripts/benchmark.ts", "--devices", String(devices), "--events", String(events), "--seed", String(seed), "--out", cfg.resultsDir], {
+    Object.assign(bench, { running: true, startedAt: new Date().toISOString(), finishedAt: null, exitCode: null, params, log: "" });
+    benchProc = spawn(process.execPath, ["scripts/benchmark.ts", "--reports", String(params.reports), "--seed", String(params.seed), "--trials", String(params.trials), "--out", cfg.resultsDir], {
       cwd: ROOT,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const append = (d: Buffer) => {
-      bench.log = (bench.log + d.toString()).slice(-8000);
-    };
+    const append = (d: Buffer) => (bench.log = (bench.log + d.toString()).slice(-8000));
     benchProc.stdout?.on("data", append);
     benchProc.stderr?.on("data", append);
     benchProc.on("exit", (code) => {
@@ -180,30 +247,29 @@ export function createApp(svc: PatchLedgerService, cfg: AppConfig) {
   app.use("/api", api);
   app.use("/api", (_req, res) => res.status(404).json({ error: "Unknown API route" }));
 
-  // --- static frontend --------------------------------------------------------
+  // ------------------------------------------------------------- frontend
   if (fs.existsSync(path.join(cfg.webDist, "index.html"))) {
-    app.use(express.static(cfg.webDist, { index: false, maxAge: "1h" }));
+    app.use(express.static(cfg.webDist, { index: false }));
     app.get(/^\/(?!api\/).*/, (_req, res) => {
       res.setHeader(
         "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self'",
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self'",
       );
       res.sendFile(path.join(cfg.webDist, "index.html"));
     });
   } else {
-    app.get("/", (_req, res) => res.type("text").send("PatchLedger API is running. Frontend not built: run npm run build:web"));
+    app.get("/", (_req, res) => res.type("text").send("VulnSeal API is running. Build the frontend with npm run build:web."));
   }
 
-  // --- errors -----------------------------------------------------------------
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    if (err instanceof ServiceError) return res.status(err.status).json({ error: err.message, details: err.details });
+    if (err instanceof ServiceError) return res.status(err.status).json({ error: err.message });
     if (err instanceof LedgerError) return res.status(err.status).json({ error: err.message, contractError: err.contractError ?? null, onChain: true });
-    if (err?.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "Evidence files are limited to 10 MB" });
+    if (err?.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "Evidence files are limited to 5 MB" });
     if (err?.type === "entity.parse.failed") return res.status(400).json({ error: "Malformed JSON body" });
-    console.error(err);
-    res.status(500).json({ error: "Internal error: " + String(err?.message ?? err) });
+    // never echo request bodies: they can contain report text or nonces
+    console.error(`[server] ${err?.name ?? "Error"}: ${String(err?.message ?? err).slice(0, 300)}`);
+    res.status(500).json({ error: "Internal error: " + String(err?.message ?? err).slice(0, 300) });
   });
 
-  const shutdown = () => benchProc?.kill("SIGTERM");
-  return { app, lab, shutdown };
+  return { app, lab, demo, shutdown: () => benchProc?.kill("SIGTERM") };
 }

@@ -1,43 +1,55 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { api } from "./api.ts";
-import { roleText, useIdentity } from "./identity.tsx";
+import { ClipboardCheck, FlaskConical, Inbox, LayoutDashboard, Network, Play, Receipt, Scale, UserRound } from "lucide-react";
+import { KIND_LABEL, useSession } from "./identity.tsx";
 import { Link, match, useLocation } from "./router.tsx";
-import { Notice } from "./ui.tsx";
-import { Dashboard } from "./pages/Dashboard.tsx";
-import { Devices } from "./pages/Devices.tsx";
-import { RegisterDevice } from "./pages/RegisterDevice.tsx";
-import { PassportPage } from "./pages/Passport.tsx";
-import { RecordEvent } from "./pages/RecordEvent.tsx";
-import { EvidenceViewer } from "./pages/EvidenceViewer.tsx";
+import { ErrorNotice, Notice } from "./ui.tsx";
+import { Overview } from "./pages/Overview.tsx";
+import { ResearcherWorkspace } from "./pages/ResearcherWorkspace.tsx";
+import { NewReport } from "./pages/NewReport.tsx";
+import { ReportDetail } from "./pages/ReportDetail.tsx";
+import { ProgramWorkspace } from "./pages/ProgramWorkspace.tsx";
+import { Explorer } from "./pages/Explorer.tsx";
 import { Disputes } from "./pages/Disputes.tsx";
-import { Verify } from "./pages/Verify.tsx";
+import { DisputeDetail } from "./pages/DisputeDetail.tsx";
 import { Audit } from "./pages/Audit.tsx";
+import { VerifyReceipt } from "./pages/VerifyReceipt.tsx";
+import { Demo } from "./pages/Demo.tsx";
 import { Research } from "./pages/Research.tsx";
 
 const NAV = [
-  { to: "/", label: "Ledger overview", idx: "01" },
-  { to: "/devices", label: "Device passports", idx: "02" },
-  { to: "/devices/new", label: "Register device", idx: "03" },
-  { to: "/disputes", label: "Dispute centre", idx: "04" },
-  { to: "/audit", label: "Audit & export", idx: "05" },
-  { to: "/research", label: "Research benchmark", idx: "06" },
-  { to: "/verify", label: "Public verification", idx: "07" },
+  { to: "/", label: "Overview", icon: LayoutDashboard },
+  { to: "/researcher", label: "Researcher workspace", icon: UserRound },
+  { to: "/program", label: "Program workspace", icon: Inbox },
+  { to: "/explorer", label: "Cross-program explorer", icon: Network },
+  { to: "/disputes", label: "Disputes & arbitration", icon: Scale },
+  { to: "/audit", label: "Audit & verification", icon: ClipboardCheck },
+  { to: "/verify", label: "Receipt verifier", icon: Receipt },
+  { to: "/demo", label: "Demo scenario", icon: Play },
+  { to: "/research", label: "Research benchmark", icon: FlaskConical },
 ];
 
-function route(path: string): { el: ReactNode; crumb: string; bare?: boolean } {
+function route(path: string): { el: ReactNode; crumb: string } {
   let m;
-  if (path === "/") return { el: <Dashboard />, crumb: "01 / Ledger overview" };
-  if (path === "/devices") return { el: <Devices />, crumb: "02 / Device passports" };
-  if (path === "/devices/new") return { el: <RegisterDevice />, crumb: "03 / Register device" };
-  if ((m = match("/devices/:id/record", path))) return { el: <RecordEvent publicId={m.id} />, crumb: `02 / ${m.id} / Record` };
-  if ((m = match("/devices/:id", path))) return { el: <PassportPage publicId={m.id} />, crumb: `02 / Passport ${m.id}` };
-  if ((m = match("/evidence/:id", path))) return { el: <EvidenceViewer evidenceId={m.id} />, crumb: `Evidence ${m.id}` };
-  if (path === "/disputes") return { el: <Disputes />, crumb: "04 / Dispute centre" };
-  if (path === "/audit") return { el: <Audit />, crumb: "05 / Audit & export" };
-  if (path === "/research") return { el: <Research />, crumb: "06 / Research benchmark" };
-  if (path === "/verify") return { el: <Verify />, crumb: "07 / Public verification", bare: true };
-  if ((m = match("/verify/:id", path))) return { el: <Verify publicId={m.id} />, crumb: "07 / Public verification", bare: true };
-  return { el: <Notice kind="warn" title="Not found.">No page at {path}. <Link to="/">Return to the overview</Link>.</Notice>, crumb: "Not found" };
+  if (path === "/") return { el: <Overview />, crumb: "Overview" };
+  if (path === "/researcher") return { el: <ResearcherWorkspace />, crumb: "Researcher workspace" };
+  if (path === "/researcher/new") return { el: <NewReport />, crumb: "Researcher workspace / New report" };
+  if ((m = match("/reports/:cid", path))) return { el: <ReportDetail cid={Number(m.cid)} />, crumb: `Report VS-${m.cid.padStart(4, "0")}` };
+  if (path === "/program") return { el: <ProgramWorkspace />, crumb: "Program workspace" };
+  if (path === "/explorer") return { el: <Explorer />, crumb: "Cross-program explorer" };
+  if (path === "/disputes") return { el: <Disputes />, crumb: "Disputes & arbitration" };
+  if ((m = match("/disputes/:did", path))) return { el: <DisputeDetail did={Number(m.did)} />, crumb: `Dispute #${m.did}` };
+  if (path === "/audit") return { el: <Audit />, crumb: "Audit & verification" };
+  if (path === "/verify") return { el: <VerifyReceipt />, crumb: "Receipt verifier" };
+  if (path === "/demo") return { el: <Demo />, crumb: "Demo scenario" };
+  if (path === "/research") return { el: <Research />, crumb: "Research benchmark" };
+  return {
+    el: (
+      <Notice kind="warn" title="Not found.">
+        No page at {path}. <Link to="/">Return to the overview</Link>.
+      </Notice>
+    ),
+    crumb: "Not found",
+  };
 }
 
 function ChainStatus() {
@@ -56,7 +68,7 @@ function ChainStatus() {
       clearInterval(t);
     };
   }, []);
-  if (!h) return <div className="rail-foot">checking node…</div>;
+  if (!h) return <div className="rail-foot">checking ledger node…</div>;
   return (
     <div className="rail-foot" role="status" aria-live="polite">
       <div>
@@ -69,35 +81,55 @@ function ChainStatus() {
   );
 }
 
-function ActorSwitch() {
-  const { meta, actor, setActor } = useIdentity();
+function IdentitySwitch() {
+  const { meta, me, signIn } = useSession();
+  const [err, setErr] = useState<unknown>(null);
   if (!meta) return null;
+  const groups = ["researcher", "program-admin", "reviewer", "arbitrator", "auditor", "governor", "outsider"];
   return (
     <div className="actor-switch">
-      <label htmlFor="actor">Acting as</label>
-      <select id="actor" value={actor?.id ?? ""} onChange={(e) => setActor(e.target.value)} aria-describedby="actor-roles">
-        {meta.identities.map((i) => (
-          <option key={i.id} value={i.id}>
-            {i.label} — {i.description.replace(" (fictional)", "")}
-          </option>
+      <label htmlFor="identity">Signed in as</label>
+      <select
+        id="identity"
+        value={me?.id ?? ""}
+        onChange={(e) => signIn(e.target.value).catch(setErr)}
+        aria-describedby="identity-role identity-sim"
+      >
+        {!me && <option value="">— choose a demo identity —</option>}
+        {groups.map((g) => (
+          <optgroup key={g} label={KIND_LABEL[g]}>
+            {meta.identities
+              .filter((i) => i.kind === g)
+              .map((i) => (
+                <option key={i.id} value={i.id}>
+                  {i.label}
+                  {i.programName ? ` — ${i.programName}` : ""}
+                  {i.note ? ` (${i.note})` : ""}
+                </option>
+              ))}
+          </optgroup>
         ))}
       </select>
-      <span className="actor-roles" id="actor-roles" title={actor?.address}>
-        {roleText(actor)}
+      {me && (
+        <span className="role-chip" id="identity-role" title={me.address}>
+          {KIND_LABEL[me.kind]}
+        </span>
+      )}
+      <span className="sim-tag" id="identity-sim" title="Choosing an identity issues a signed demo session cookie. There is no password: this simulates sign-in for local evaluation and is not real authentication.">
+        simulated sign-in
       </span>
+      {err ? <ErrorNotice error={err} /> : null}
     </div>
   );
 }
 
 export function App() {
   const { path } = useLocation();
-  const { metaError } = useIdentity();
+  const { metaError } = useSession();
   const r = route(path);
   useEffect(() => {
-    document.title = `${r.crumb.replace(/^\d+ \/ /, "")} · PatchLedger`;
+    document.title = `${r.crumb.split(" / ")[0]} · VulnSeal`;
   }, [r.crumb]);
-
-  if (r.bare) return <main id="main">{r.el}</main>;
   return (
     <div className="shell">
       <a className="skip-link" href="#main">
@@ -106,16 +138,19 @@ export function App() {
       <aside className="rail">
         <div className="rail-brand">
           <Link to="/" className="wordmark">
-            PatchLedger
+            VulnSeal
           </Link>
-          <div className="sub">Repair passport archive · research prototype</div>
+          <div className="sub">Report commitments · cross-program arbitration · research prototype</div>
         </div>
         <nav aria-label="Primary">
           {NAV.map((n) => {
-            const active = n.to === "/" ? path === "/" : n.to === "/devices" ? path === "/devices" || (path.startsWith("/devices/") && path !== "/devices/new") : path.startsWith(n.to);
+            const active = n.to === "/" ? path === "/" : path === n.to || path.startsWith(n.to + "/") || (n.to === "/researcher" && path.startsWith("/reports/"));
+            const Icon = n.icon;
             return (
               <Link key={n.to} to={n.to} aria-current={active ? "page" : undefined}>
-                <span className="idx">{n.idx}</span>
+                <span className="ico">
+                  <Icon size={16} aria-hidden="true" />
+                </span>
                 <span>{n.label}</span>
               </Link>
             );
@@ -126,15 +161,17 @@ export function App() {
       <div className="main">
         <div className="topbar">
           <span className="crumb">{r.crumb}</span>
-          <ActorSwitch />
+          <IdentitySwitch />
         </div>
         <main className="content" id="main" tabIndex={-1}>
-          {metaError ? <Notice kind="error" title="Cannot reach the PatchLedger API.">{String((metaError as Error).message)}</Notice> : null}
+          {metaError ? (
+            <Notice kind="error" title="Cannot reach the VulnSeal API.">
+              {String((metaError as Error).message)}
+            </Notice>
+          ) : null}
           {r.el}
         </main>
       </div>
     </div>
   );
 }
-
-export { api };

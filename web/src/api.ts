@@ -1,4 +1,4 @@
-// API client. The demo identity travels in X-Demo-Actor (demonstration only, not authentication).
+// API client. The session is an HttpOnly cookie set by POST /api/session (simulated sign-in).
 export class ApiError extends Error {
   status: number;
   contractError?: { name: string; args: string[] } | null;
@@ -11,19 +11,14 @@ export class ApiError extends Error {
   }
 }
 
-let currentActor = "";
-export const setApiActor = (id: string) => (currentActor = id);
-export const getApiActor = () => currentActor;
-
 async function request<T>(method: string, url: string, body?: unknown, form?: FormData): Promise<T> {
   const headers: Record<string, string> = {};
-  if (currentActor) headers["X-Demo-Actor"] = currentActor;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   let res: Response;
   try {
-    res = await fetch(url, { method, headers, body: form ?? (body !== undefined ? JSON.stringify(body) : undefined) });
+    res = await fetch(url, { method, headers, credentials: "same-origin", body: form ?? (body !== undefined ? JSON.stringify(body) : undefined) });
   } catch {
-    throw new ApiError("Cannot reach the PatchLedger server at " + window.location.origin + ". Is ./run.sh still running?", 0);
+    throw new ApiError(`Cannot reach the VulnSeal server at ${window.location.origin}. Is ./run.sh still running?`, 0);
   }
   const text = await res.text();
   let data: any = null;
@@ -39,116 +34,112 @@ async function request<T>(method: string, url: string, body?: unknown, form?: Fo
 export const api = {
   get: <T,>(url: string) => request<T>("GET", url),
   post: <T,>(url: string, body?: unknown) => request<T>("POST", url, body ?? {}),
+  del: <T,>(url: string) => request<T>("DELETE", url),
   upload: <T,>(url: string, form: FormData) => request<T>("POST", url, undefined, form),
 };
 
-// ---- shared types (mirror server responses) ----
+/** Fetch a JSON download endpoint and save it via a blob (keeps cookies, works for 403 messages). */
+export async function downloadJson(url: string, fallbackName: string) {
+  const res = await fetch(url, { credentials: "same-origin" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new ApiError(body?.error ?? `Download failed (${res.status})`, res.status, body);
+  }
+  const name = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") ?? "")?.[1] ?? fallbackName;
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  return name;
+}
+
 export interface Identity {
   id: string;
-  index: number;
   label: string;
-  description: string;
+  kind: "governor" | "researcher" | "program-admin" | "reviewer" | "arbitrator" | "auditor" | "outsider";
   roles: string[];
+  programId: number;
+  programName?: string | null;
   address: string;
+  note?: string;
+}
+export interface Program {
+  id: number;
+  slug: string;
+  name: string;
+  short: string;
+  blurb: string;
 }
 export interface Meta {
   identities: Identity[];
-  recordTypes: Record<string, string>;
-  categories: string[];
-  results: string[];
-  components: string[];
-  partOrigins: string[];
-  formFactors: string[];
-  evidenceKinds: string[];
-  evidenceCategories: Record<string, string>;
+  programs: Program[];
+  statuses: string[];
+  relations: string[];
+  disputeKinds: string[];
+  decisions: Record<string, string>;
+  decisionsForKind: Record<string, number[]>;
+  reasonCodes: Record<string, string>;
+  logKinds: Record<string, string>;
+  severities: string[];
   demoLab: boolean;
-  publicBaseUrl: string;
 }
-export interface EvidenceView {
-  id: string;
+export interface Actor {
+  id: string | null;
+  label: string;
   kind: string;
-  sha256: string;
-  mime: string;
-  size: number;
-  filename: string;
-  description: string;
-  uploadedBy: { id: string; label: string };
-  access: string;
-  committedInSeq: number;
-  committedSha256: string;
-  integrity: string;
-  canViewContent: boolean;
-  reusedElsewhere: { id: string; publicId: string; seq: number | null }[];
+  address: string;
 }
-export interface EventView {
+export interface LedgerEvent {
   seq: number;
-  type: string;
-  typeLabel: string;
-  payload: Record<string, any>;
-  claimedAt: string | null;
-  recordedAt: string;
-  actor: { id: string; label: string; description: string; address: string };
-  recordHash: string;
-  prevHash: string;
-  payloadDigest: string;
+  kind: number;
+  kindName: string;
+  subject: string;
+  actor: Actor;
+  at: string;
+  dataHash: string;
+  entryHash: string;
   txHash: string;
   blockNumber: number;
-  gasUsed: number;
-  refSeq: number | null;
-  outcome: string;
-  outcomeLabel: string;
-  evidence: EvidenceView[];
-  category: string;
-  categoryLabel: string;
-  flags: string[];
-  openChallengeSeq: number | null;
-  challenges: { seq: number; resolvedBySeq: number | null; outcome: string | null }[];
-  supersededBySeq: number | null;
-  corroboratedBySeqs: number[];
-  anchor: string;
 }
-export interface Conflict {
-  component: string;
-  replacedSeq: number;
-  assertedOriginalSeq: number;
-  status: string;
-  note: string;
+export interface AssociationView {
+  aid: number;
+  cidA: number;
+  cidB: number;
+  refA: string;
+  refB: string;
+  programs: string[];
+  relation: number;
+  relationName: string;
+  effectiveRelation: number;
+  effectiveRelationName: string;
+  status: number;
+  statusName: string;
+  decidedRelation: number;
+  family: string | null;
+  proposer: Actor;
+  reviewer: Actor | null;
+  rationaleDigest: string | null;
+  rationale: string | null;
+  reviews: { reviewer: string; approve: boolean; digest: string; rationale: string | null; tx: string; at: string }[];
+  tx: string | null;
 }
-export interface Passport {
-  device: { publicId: string; deviceKey: string; brand: string; model: string; year: number | null; formFactor: string; synthetic: boolean; createdAt: string };
-  headHash: string | null;
-  onChainHeadHash: string | null;
-  onChainRecords: number | null;
-  chainError: string | null;
-  events: EventView[];
-  conflicts: Conflict[];
-  openDisputes: number;
-  pendingEvidence: EvidenceView[];
-}
-export interface Finding {
-  severity: "error" | "warning" | "info";
-  code: string;
-  seq?: number;
-  evidenceId?: string;
-  message: string;
-}
-export interface IntegrityReport {
-  publicId: string;
-  deviceKey: string;
-  checkedAt: string;
-  ok: boolean;
-  chain: { contract: string; chainId: number; onChainRecords: number; offChainRecords: number; headHash: string | null; contractVerifyChain: boolean | null };
-  evidenceChecked: number;
-  findings: Finding[];
-}
-export interface DeviceSummary {
-  publicId: string;
-  brand: string;
-  model: string;
-  year: number | null;
-  formFactor: string;
-  synthetic: boolean;
-  records: number;
-  openDisputes: number;
-  lastRecordedAt: string | null;
+export interface DisputeSummary {
+  did: number;
+  kind: number;
+  kindName: string;
+  status: number;
+  statusName: string;
+  round: number;
+  subject: number;
+  refs: string[];
+  programs: string[];
+  decision: number | null;
+  decisionName: string | null;
+  reasonCode: number | null;
+  openedAt: string | null;
+  decidedAt: string | null;
 }

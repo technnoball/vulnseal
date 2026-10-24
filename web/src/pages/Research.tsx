@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { FlaskConical } from "lucide-react";
 import { api, ApiError } from "../api.ts";
 import { ErrorNotice, Field, Loading, Notice, PageHead, Sheet, fmtTime } from "../ui.tsx";
 
@@ -6,55 +7,57 @@ interface Stats {
   n: number;
   median: number;
   p95: number | null;
-  mean: number;
-  min: number;
-  max: number;
 }
-interface StoreResult {
+interface Design {
   id: string;
   name: string;
   description: string;
-  insert: Stats;
-  verify: Stats;
-  throughputPerSec: number;
-  storage: { offChainBytesPerRecord: number; onChainBytesPerRecord: number | null; calldataBytesPerRecord: number | null; method: string };
-  gas: { meanPerRecord: number; perType: Record<string, { n: number; median: number }>; deployment: number } | null;
+  metrics: {
+    commit: Stats;
+    receiptVerify: Stats;
+    transition: Stats;
+    throughputCommitsPerSec: number;
+    storage: { bytesPerSubmission: number; bytesPerEvent: number; onChainBytesPerSubmission: number | null };
+    gas: { meanPerSubmission: number; perOperation: Record<string, number> } | null;
+  };
 }
-interface ScenarioResult {
+interface Result {
   trials: number;
   prevented: number;
   detected: number;
   undetected: number;
-  protectedRate: number;
-  note: string;
+  passed?: number;
+  note?: string;
 }
 interface Bench {
   generatedAt: string;
-  config: { devices: number; eventsPerDevice: number; seed: number; trials: number; totalRecords: number; node: string; platform: string; arch: string; cpu: string };
-  stores: StoreResult[];
-  scenarios: { id: string; title: string; attacker: string; kind: string; results: Record<string, ScenarioResult> }[];
+  config: Record<string, any>;
+  designs: Design[];
+  scenarios: { id: string; title: string; attacker: string; kind: string; results: Record<string, Result> }[];
+  disclosure: { item: string; designs: Record<string, string> }[];
   notes: string[];
-}
-interface Status {
-  running: boolean;
-  startedAt: string | null;
-  finishedAt: string | null;
-  exitCode: number | null;
-  params: { devices: number; events: number; seed: number } | null;
-  log: string;
 }
 
 const ms = (v: number | null | undefined) => (v === null || v === undefined ? "—" : v < 1 ? v.toFixed(3) : v < 100 ? v.toFixed(2) : v.toFixed(0));
 
-function outcome(r: ScenarioResult | undefined, kind: string) {
+function Cell({ r, kind }: { r?: Result; kind: string }) {
   if (!r) return <span className="muted">n/a</span>;
-  const label = kind === "preservation" ? (r.undetected === 0 ? "preserved" : r.prevented === 0 ? "lost" : "partly lost") : r.undetected === 0 ? (r.prevented === r.trials ? "prevented" : r.detected === r.trials ? "detected" : "prevented/detected") : r.undetected === r.trials ? "undetected" : "partial";
+  if (kind === "functional") {
+    const ok = (r.passed ?? 0) === r.trials;
+    return (
+      <span className={ok ? "out-prevented" : "out-undetected"} title={r.note}>
+        {ok ? "works" : "fails"} {r.passed}/{r.trials}
+      </span>
+    );
+  }
+  const protectedN = r.prevented + r.detected;
   const cls = r.undetected === 0 ? (r.prevented === r.trials ? "out-prevented" : "out-detected") : "out-undetected";
+  const label = r.undetected === 0 ? (r.prevented === r.trials ? "prevented" : r.detected === r.trials ? "detected" : "prevented/detected") : r.undetected === r.trials ? "undetected" : "partial";
   return (
     <span className={cls} title={r.note}>
-      {label} {Math.round(r.protectedRate * 100)}%
+      {label} {Math.round((protectedN / r.trials) * 100)}%
       <div className="small muted" style={{ fontWeight: 400 }}>
-        {kind === "preservation" ? `${r.prevented} preserved / ${r.trials}` : `${r.prevented}P · ${r.detected}D · ${r.undetected}U / ${r.trials}`}
+        {r.prevented}P · {r.detected}D · {r.undetected}U
       </div>
     </span>
   );
@@ -63,26 +66,18 @@ function outcome(r: ScenarioResult | undefined, kind: string) {
 export function Research() {
   const [data, setData] = useState<Bench | null>(null);
   const [loadErr, setLoadErr] = useState<unknown>(null);
-  const [status, setStatus] = useState<Status | null>(null);
-  const [form, setForm] = useState({ devices: "10", events: "8", seed: "42" });
+  const [status, setStatus] = useState<any>(null);
+  const [form, setForm] = useState({ reports: "40", seed: "42", trials: "10" });
   const [err, setErr] = useState<unknown>(null);
-
-  const loadLatest = () =>
-    api.get<Bench>("/api/benchmark/latest").then(
-      (d) => {
-        setData(d);
-        setLoadErr(null);
-      },
-      (e) => setLoadErr(e),
-    );
+  const loadLatest = () => api.get<Bench>("/api/benchmark/latest").then((d) => (setData(d), setLoadErr(null)), setLoadErr);
   useEffect(() => {
     loadLatest();
-    api.get<Status>("/api/benchmark/status").then(setStatus, () => undefined);
+    api.get("/api/benchmark/status").then(setStatus, () => undefined);
   }, []);
   useEffect(() => {
     if (!status?.running) return;
     const t = setInterval(async () => {
-      const s = await api.get<Status>("/api/benchmark/status").catch(() => null);
+      const s = await api.get<any>("/api/benchmark/status").catch(() => null);
       if (s) {
         setStatus(s);
         if (!s.running) loadLatest();
@@ -90,51 +85,47 @@ export function Research() {
     }, 1000);
     return () => clearInterval(t);
   }, [status?.running]);
-
-  async function run() {
+  const run = async () => {
     setErr(null);
     try {
-      setStatus(await api.post<Status>("/api/benchmark/run", { devices: Number(form.devices), events: Number(form.events), seed: Number(form.seed) }));
+      setStatus(await api.post("/api/benchmark/run", { reports: Number(form.reports), seed: Number(form.seed), trials: Number(form.trials) }));
     } catch (e) {
       setErr(e);
     }
-  }
-  const storeIds = data?.stores.map((s) => s.id) ?? [];
-
+  };
+  const ids = data?.designs.map((d) => d.id) ?? [];
   return (
     <>
       <PageHead
-        kicker="Section 06 · Research evaluation"
-        title="Blockchain vs. centralised recordkeeping"
-        lede="A reproducible benchmark over synthetic device histories. Latency, storage and gas are direct measurements on this machine; the attack matrix reports the outcomes of simulated attacks executed against each store."
+        kicker="Research evaluation"
+        title="Blockchain commitments vs. centralised alternatives"
+        lede="A reproducible benchmark over synthetic reports. Latency, storage and gas are measured on this machine; the scenario matrix reports simulated attacks and functional checks that are actually executed against each design."
       />
       <div className="grid-2">
-        <Sheet tab="Run benchmark">
+        <Sheet tab="Run the benchmark">
           <ErrorNotice error={err} />
           <div className="form-row">
-            <Field label="Devices" htmlFor="b-dev">
-              <input id="b-dev" inputMode="numeric" value={form.devices} onChange={(e) => setForm({ ...form, devices: e.target.value })} />
+            <Field label="Synthetic reports" htmlFor="b-r">
+              <input id="b-r" inputMode="numeric" value={form.reports} onChange={(e) => setForm({ ...form, reports: e.target.value })} />
             </Field>
-            <Field label="Events per device" htmlFor="b-ev">
-              <input id="b-ev" inputMode="numeric" value={form.events} onChange={(e) => setForm({ ...form, events: e.target.value })} />
+            <Field label="Random seed" htmlFor="b-s">
+              <input id="b-s" inputMode="numeric" value={form.seed} onChange={(e) => setForm({ ...form, seed: e.target.value })} />
             </Field>
-            <Field label="Random seed" htmlFor="b-seed">
-              <input id="b-seed" inputMode="numeric" value={form.seed} onChange={(e) => setForm({ ...form, seed: e.target.value })} />
+            <Field label="Trials per scenario" htmlFor="b-t">
+              <input id="b-t" inputMode="numeric" value={form.trials} onChange={(e) => setForm({ ...form, trials: e.target.value })} />
             </Field>
           </div>
           <div className="row" style={{ marginTop: 12 }}>
             <button className="btn primary" onClick={run} disabled={status?.running}>
-              {status?.running ? "Benchmark running…" : "Run benchmark"}
+              <FlaskConical size={16} aria-hidden="true" /> {status?.running ? "Benchmark running…" : "Run benchmark"}
             </button>
-            <span className="small muted">Starts its own throw-away local chain; the demo ledger is not touched.</span>
+            <span className="small muted">Uses its own throw-away chain; the demo ledger is untouched.</span>
           </div>
           {status && (status.running || status.log) && (
             <div style={{ marginTop: 12 }}>
-              <div className="small mono" style={{ marginBottom: 4 }}>
-                {status.running ? `running since ${fmtTime(status.startedAt)}` : `finished ${fmtTime(status.finishedAt)} · exit ${status.exitCode}`}
-              </div>
+              <div className="small mono">{status.running ? `running since ${fmtTime(status.startedAt)}` : `finished ${fmtTime(status.finishedAt)} · exit ${status.exitCode}`}</div>
               <pre className="log" aria-live="polite">
-                {status.log.split("\n").slice(-14).join("\n")}
+                {String(status.log).split("\n").slice(-14).join("\n")}
               </pre>
             </div>
           )}
@@ -142,84 +133,86 @@ export function Research() {
         <Sheet tab="Reading the results">
           <dl className="kv small">
             <dt>Measured</dt>
-            <dd>Insert / verify latency, throughput, storage and gas — wall-clock on this laptop, single client, sequential writes.</dd>
+            <dd>Commit, receipt-verification and status-transition latency; throughput; storage; gas.</dd>
             <dt>Simulated</dt>
-            <dd>Attack outcomes: each attack is executed and the store’s own verifier is then run. P = prevented, D = detected afterwards, U = undetected.</dd>
+            <dd>Attacks are executed, then each design's own verifier runs. P prevented, D detected afterwards, U undetected.</dd>
             <dt>Caveat</dt>
-            <dd>One machine, automining local chain (no consensus delay). Descriptive statistics only — no significance testing.</dd>
+            <dd>One machine, one client, an automining single-node chain. Descriptive statistics only.</dd>
           </dl>
         </Sheet>
       </div>
       {!data && !loadErr && <Loading />}
-      {loadErr instanceof ApiError && loadErr.status === 404 && <Notice kind="warn">No benchmark results yet — run one above (takes well under a minute with the defaults).</Notice>}
+      {loadErr instanceof ApiError && loadErr.status === 404 && <Notice kind="warn">No results yet — run the benchmark above.</Notice>}
       {data && (
         <>
           <p className="small muted">
-            Latest run {fmtTime(data.generatedAt)} · {data.config.devices} devices × {data.config.eventsPerDevice} events (= {data.config.totalRecords} records per store) · seed {data.config.seed} · {data.config.trials} trials per attack · Node{" "}
-            {data.config.node} on {data.config.platform}/{data.config.arch} ({data.config.cpu}) · <a href="/api/benchmark/report">Markdown report</a> · <a href="/api/benchmark/latest">raw JSON</a>
+            Run {fmtTime(data.generatedAt)} · {data.config.reports} reports · seed {data.config.seed} · {data.config.trials} trials · Node {data.config.node} · {data.config.cpu} ·{" "}
+            <a href="/api/benchmark/report">Markdown report</a> · <a href="/api/benchmark/latest">JSON</a>
           </p>
           <Sheet tab="Performance and storage (measured)" flush>
             <div className="table-scroll">
               <table className="ledger perf">
                 <thead>
                   <tr>
-                    <th scope="col">Store</th>
-                    <th scope="col" className="num">Insert median ms</th>
-                    <th scope="col" className="num">Insert p95 ms</th>
-                    <th scope="col" className="num">Throughput rec/s</th>
-                    <th scope="col" className="num">Verify history median ms</th>
-                    <th scope="col" className="num">Verify p95 ms</th>
-                    <th scope="col" className="num">Off-chain B/rec</th>
-                    <th scope="col" className="num">On-chain B/rec</th>
-                    <th scope="col" className="num">Gas/rec</th>
+                    <th scope="col">Design</th>
+                    <th scope="col" className="num">Commit median ms</th>
+                    <th scope="col" className="num">Commit p95 ms</th>
+                    <th scope="col" className="num">Commits/s</th>
+                    <th scope="col" className="num">Receipt verify median ms</th>
+                    <th scope="col" className="num">Status change median ms</th>
+                    <th scope="col" className="num">Bytes / submission</th>
+                    <th scope="col" className="num">Bytes / event</th>
+                    <th scope="col" className="num">On-chain B / submission</th>
+                    <th scope="col" className="num">Gas / submission</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {data.stores.map((s) => (
-                    <tr key={s.id}>
+                  {data.designs.map((d) => (
+                    <tr key={d.id}>
                       <td>
-                        <b>{s.name}</b>
-                        <div className="small muted">{s.description}</div>
+                        <b>{d.name}</b>
+                        <div className="small muted">{d.description}</div>
                       </td>
-                      <td className="num">{ms(s.insert.median)}</td>
-                      <td className="num">{ms(s.insert.p95)}</td>
-                      <td className="num">{s.throughputPerSec.toFixed(0)}</td>
-                      <td className="num">{ms(s.verify.median)}</td>
-                      <td className="num">{ms(s.verify.p95)}</td>
-                      <td className="num">{s.storage.offChainBytesPerRecord.toFixed(0)}</td>
-                      <td className="num">{s.storage.onChainBytesPerRecord === null ? "—" : s.storage.onChainBytesPerRecord.toFixed(0)}</td>
-                      <td className="num">{s.gas ? s.gas.meanPerRecord.toFixed(0) : "—"}</td>
+                      <td className="num">{ms(d.metrics.commit.median)}</td>
+                      <td className="num">{ms(d.metrics.commit.p95)}</td>
+                      <td className="num">{d.metrics.throughputCommitsPerSec.toFixed(0)}</td>
+                      <td className="num">{ms(d.metrics.receiptVerify.median)}</td>
+                      <td className="num">{ms(d.metrics.transition.median)}</td>
+                      <td className="num">{d.metrics.storage.bytesPerSubmission.toFixed(0)}</td>
+                      <td className="num">{d.metrics.storage.bytesPerEvent.toFixed(0)}</td>
+                      <td className="num">{d.metrics.storage.onChainBytesPerSubmission === null ? "—" : d.metrics.storage.onChainBytesPerSubmission.toFixed(0)}</td>
+                      <td className="num">{d.metrics.gas ? d.metrics.gas.meanPerSubmission.toFixed(0) : "—"}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           </Sheet>
-          <Sheet tab="Attack and integrity scenarios (simulated attacks, real executions)" flush>
+          <Sheet tab="Scenarios (simulated attacks and functional checks, actually executed)" flush>
             <div className="table-scroll">
               <table className="ledger matrix">
                 <thead>
                   <tr>
                     <th scope="col">Scenario</th>
-                    {data.stores.map((s) => (
-                      <th key={s.id} scope="col">
-                        {s.name}
+                    {data.designs.map((d) => (
+                      <th scope="col" key={d.id}>
+                        {d.name}
                       </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {data.scenarios.map((sc) => (
-                    <tr key={sc.id}>
+                  {data.scenarios.map((s) => (
+                    <tr key={s.id}>
                       <td>
                         <b>
-                          {sc.id} · {sc.title}
+                          {s.id} · {s.title}
                         </b>
-                        <div className="small muted">{sc.attacker}</div>
+                        <div className="small muted">{s.attacker}</div>
                       </td>
-                      {storeIds.map((id) => (
+                      {ids.map((id) => (
                         <td key={id} className="outcome">
-                          {outcome(sc.results[id], sc.kind)}
+                          <Cell r={s.results[id]} kind={s.kind} />
                         </td>
                       ))}
                     </tr>
@@ -228,30 +221,34 @@ export function Research() {
               </table>
             </div>
           </Sheet>
-          {data.stores.find((s) => s.gas) && (
-            <Sheet tab="Gas by record type (measured from receipts)">
-              <div className="table-scroll">
+          <Sheet tab="Who can see what (inspected from the stored data of each design)" flush>
+            <div className="table-scroll">
               <table className="ledger">
                 <thead>
                   <tr>
-                    <th scope="col">Record type</th>
-                    <th scope="col" className="num">n</th>
-                    <th scope="col" className="num">Median gas</th>
+                    <th scope="col">Item</th>
+                    {data.designs.map((d) => (
+                      <th scope="col" key={d.id}>
+                        {d.name}
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {Object.entries(data.stores.find((s) => s.gas)!.gas!.perType).map(([t, g]) => (
-                    <tr key={t}>
-                      <td>{t}</td>
-                      <td className="num">{g.n}</td>
-                      <td className="num">{g.median}</td>
+                  {data.disclosure.map((x) => (
+                    <tr key={x.item}>
+                      <td className="small">{x.item}</td>
+                      {ids.map((id) => (
+                        <td key={id} className="small">
+                          {x.designs[id]}
+                        </td>
+                      ))}
                     </tr>
                   ))}
                 </tbody>
               </table>
-              </div>
-            </Sheet>
-          )}
+            </div>
+          </Sheet>
           <Sheet tab="Notes and limitations">
             <ul className="small" style={{ margin: 0, paddingLeft: 18 }}>
               {data.notes.map((n, i) => (

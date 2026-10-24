@@ -9,6 +9,6 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: 5173,
-    proxy: { "/api": `http://127.0.0.1:${process.env.PL_PORT ?? 4600}` },
+    proxy: { "/api": `http://127.0.0.1:${process.env.VS_PORT ?? 4700}` },
   },
 });
