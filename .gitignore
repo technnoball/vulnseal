@@ -10,3 +10,6 @@ data/
 !.env.example
 .DS_Store
 *.log
+
+# PatchLedger runtime data kept from before the VulnSeal migration
+data-patchledger/

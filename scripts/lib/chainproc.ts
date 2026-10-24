@@ -52,11 +52,13 @@ export interface ChainProcess {
   stop: () => Promise<void>;
 }
 
-export async function startChain(port?: number): Promise<ChainProcess> {
+/** initialDate: start the chain's clock in the past so a journal can be replayed with its original block times. */
+export async function startChain(port?: number, opts: { initialDate?: string } = {}): Promise<ChainProcess> {
   const p = port ?? (await freePort());
   const bin = path.join(ROOT, "node_modules/.bin/hardhat");
   const proc = spawn(bin, ["node", "--config", "hardhat.config.cjs", "--hostname", "127.0.0.1", "--port", String(p)], {
     cwd: ROOT,
+    env: { ...process.env, ...(opts.initialDate ? { VS_CHAIN_INITIAL_DATE: opts.initialDate } : {}) },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";

@@ -1,51 +1,35 @@
-// Ethers client for the deployed PatchLedger contract.
-// Demo identities sign locally with keys derived from the public Hardhat test
-// mnemonic. The server never pre-checks roles: authorization is enforced by the
-// contract, and reverts are surfaced to the caller as LedgerError.
+// Ethers client for the VulnSeal contract. Transactions are signed here (not by the
+// node) so the raw bytes can be journaled for replay. Roles are never pre-checked:
+// the contract decides, and its custom errors are turned into readable messages.
 import fs from "node:fs";
 import path from "node:path";
 import {
   Contract,
   ContractFactory,
-  HDNodeWallet,
   JsonRpcProvider,
-  Mnemonic,
   Network,
-  Wallet,
   type InterfaceAbi,
-  type TransactionReceipt,
+  type LogDescription,
+  type TransactionRequest,
+  type Wallet,
 } from "ethers";
-import { HARDHAT_TEST_MNEMONIC, IDENTITIES, ROLE, type Identity } from "./domain.ts";
-import { NO_REF } from "./ledger-hash.ts";
+import { IDENTITY_DEFS, ROLE, roleMask } from "./domain.ts";
+import type { Journal } from "./journal.ts";
+import { faucetWallet, type Keyring } from "./keys.ts";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-export const ARTIFACT_PATH = path.join(ROOT, "build/artifacts/contracts/PatchLedger.sol/PatchLedger.json");
+export const ARTIFACT_PATH = path.join(ROOT, "build/artifacts/contracts/VulnSeal.sol/VulnSeal.json");
 
 export function loadArtifact(): { abi: InterfaceAbi; bytecode: string } {
   if (!fs.existsSync(ARTIFACT_PATH)) throw new Error(`Contract artifact missing at ${ARTIFACT_PATH}. Run: npm run compile`);
   return JSON.parse(fs.readFileSync(ARTIFACT_PATH, "utf8"));
 }
 
-export interface OnChainRecord {
-  seq: number;
-  recordHash: string;
-  prevHash: string;
-  payloadDigest: string;
-  actor: string;
-  timestamp: number;
-  recordType: number;
-  outcome: number;
-  refSeq: number;
-}
-
-export interface WriteResult {
-  seq: number;
-  recordHash: string;
-  prevHash: string;
-  txHash: string;
-  blockNumber: number;
-  gasUsed: number;
-  timestamp: number;
+export function makeProvider(rpcUrl: string, chainId = 31337): JsonRpcProvider {
+  const network = Network.from(chainId);
+  const p = new JsonRpcProvider(rpcUrl, network, { staticNetwork: network, batchMaxCount: 1, cacheTimeout: -1 });
+  p.pollingInterval = 100;
+  return p;
 }
 
 export class LedgerError extends Error {
@@ -58,42 +42,91 @@ export class LedgerError extends Error {
   }
 }
 
-const ROLE_NAMES = Object.entries(ROLE) as [string, number][];
-export const roleMaskNames = (mask: number) => ROLE_NAMES.filter(([, v]) => (mask & v) !== 0).map(([k]) => k);
+export interface TxResult {
+  hash: string;
+  blockNumber: number;
+  timestamp: number;
+  gasUsed: number;
+  events: LogDescription[];
+}
 
-const ERROR_STATUS: Record<string, number> = {
-  NotAuthorized: 403,
-  NotAdmin: 403,
-  NotOriginalActor: 403,
-  SelfResolution: 403,
-  SelfChallenge: 403,
-  SelfCorroboration: 403,
-  ConflictOfInterest: 403,
-  StalePrevHash: 409,
-  DisputeAlreadyOpen: 409,
-  DeviceAlreadyRegistered: 409,
-  AlreadySuperseded: 409,
-  DisputeNotOpen: 409,
+const roleNames = (mask: number) =>
+  Object.entries(ROLE)
+    .filter(([, v]) => (mask & v) !== 0)
+    .map(([k]) => k.toLowerCase().replace("_", " "))
+    .join(" or ");
+
+const ERRORS: Record<string, [number, (a: string[]) => string]> = {
+  NotGovernor: [403, () => "only the consortium desk can do this"],
+  NotAuthorized: [403, (a) => `this account does not hold the ${roleNames(Number(a[1]))} role`],
+  WrongProgram: [403, (a) => `this account belongs to program ${a[1] === "0" ? "none" : a[1]}, not program ${a[0]}`],
+  SelfReview: [403, () => "the researcher who submitted a report cannot review it"],
+  NotCommitmentOwner: [403, () => "only the researcher who anchored a commitment can revise it"],
+  ProposerCannotReview: [403, () => "whoever proposed an association cannot also review it"],
+  ConflictedArbitrator: [403, (a) => `this arbitrator is affiliated with program ${a[0]}, which is involved in the dispute, and must recuse`],
+  PartyCannotVote: [403, () => "a party to the dispute cannot vote on it"],
+  PriorPanelMember: [403, () => "arbitrators who decided the first round cannot sit on the appeal"],
+  ArbitratorRecused: [403, () => "this arbitrator has recused from the dispute"],
+  NotAParty: [403, () => "only the researchers or program admins involved can do this"],
+  AlreadyVoted: [409, () => "this arbitrator has already voted in this round"],
+  ReplayedCommitment: [409, () => "this commitment was already anchored by this account"],
+  AlreadySuperseded: [409, (a) => `commitment ${a[0]} was already replaced by ${a[1]}`],
+  CommitmentSuperseded: [409, (a) => `commitment ${a[0]} has been replaced by a revision; act on the newer one`],
+  AssociationExists: [409, (a) => `these two reports already have an active association (#${a[0]})`],
+  AssociationNotPending: [409, () => "this association is no longer awaiting review"],
+  SideAlreadyReviewed: [409, () => "this program has already reviewed the association"],
+  DisputeExists: [409, (a) => `there is already an open dispute (#${a[0]}) about this`],
+  DisputeOpen: [409, () => "a dispute about this report is still open"],
+  InvalidTransition: [409, (a) => `cannot move from status ${a[0]} to ${a[1]}`],
+  NotOpenForVoting: [409, () => "the dispute is not open for votes"],
+  NotDecided: [409, () => "the dispute has not been decided yet"],
+  AppealWindowClosed: [409, () => "the appeal window has closed"],
+  AppealWindowOpen: [409, () => "the appeal window is still open"],
+  RevealRequired: [409, () => "the report has not been revealed and verified yet"],
+  SameProgram: [422, () => "both reports belong to the same program"],
+  InvalidDecision: [422, () => "that decision is not available for this kind of dispute"],
+  InvalidSubject: [422, () => "this dispute subject is not eligible"],
+  InvalidOutcome: [422, () => "invalid outcome code"],
+  EmptyDigest: [422, () => "a required digest was empty"],
+  UnknownCommitment: [404, (a) => `no commitment #${a[0]}`],
+  UnknownAssociation: [404, (a) => `no association #${a[0]}`],
+  UnknownDispute: [404, (a) => `no dispute #${a[0]}`],
+  UnknownProgram: [404, (a) => `no program #${a[0]}`],
+  UnknownPolicy: [422, (a) => `program ${a[0]} has no policy version ${a[1]}`],
+  ProgramInactive: [409, () => "program is not active"],
 };
 
-const ERROR_TEXT: Record<string, (a: string[]) => string> = {
-  NotAuthorized: (a) => `account ${a[0]} does not hold a required role (${roleMaskNames(Number(a[1])).join(" or ")})`,
-  StalePrevHash: (a) => `expected previous record ${a[0].slice(0, 12)}… but the current head is ${a[1].slice(0, 12)}… — the history changed or the predecessor is invalid`,
-  SelfResolution: () => "the author of a disputed claim cannot resolve the dispute about it",
-  ConflictOfInterest: () => "the challenger cannot resolve their own challenge",
-  SelfChallenge: () => "an actor cannot challenge their own claim",
-  SelfCorroboration: () => "an actor cannot corroborate their own claim",
-  NotOriginalActor: () => "only the original author (or an auditor) may correct or add evidence to this record",
-  DisputeAlreadyOpen: (a) => `record #${a[0]} already has an open challenge (#${a[1]})`,
-  DisputeNotOpen: (a) => `challenge #${a[0]} is already resolved`,
-  DeviceAlreadyRegistered: () => "this device key is already registered",
-  AlreadySuperseded: (a) => `record #${a[0]} was already superseded by correction #${a[1]}; correct the correction instead`,
-  InvalidReference: (a) => `record #${a[0]} cannot be referenced by this record type`,
-  UnknownDevice: () => "device is not registered on-chain",
-};
+export function toLedgerError(e: unknown, rpcUrl: string, contract?: Contract): LedgerError {
+  if (e instanceof LedgerError) return e;
+  const err = e as any;
+  const msg = String(err?.shortMessage ?? err?.message ?? e);
+  if (/ECONNREFUSED|fetch failed|socket hang up/i.test(msg + String(err?.cause ?? "")) || err?.code === "ECONNREFUSED") {
+    return new LedgerError(`The local blockchain at ${rpcUrl} is not responding. Start everything with ./run.sh.`, 503);
+  }
+  let revert: { name: string; args: unknown[] } | undefined = err?.revert;
+  const data = err?.data ?? err?.info?.error?.data?.data ?? err?.info?.error?.data;
+  if (!revert && contract && typeof data === "string" && data.length >= 10) {
+    try {
+      const parsed = contract.interface.parseError(data);
+      if (parsed) revert = { name: parsed.name, args: [...parsed.args] };
+    } catch {
+      /* not one of ours */
+    }
+  }
+  if (!revert) {
+    const m = /custom error '(\w+)\((.*)\)'/.exec(msg + " " + String(err?.info?.error?.message ?? ""));
+    if (m) revert = { name: m[1], args: m[2] ? m[2].split(",").map((s) => s.trim().replace(/^"|"$/g, "")) : [] };
+  }
+  if (revert) {
+    const args = revert.args.map(String);
+    const [status, text] = ERRORS[revert.name] ?? [422, () => revert!.name];
+    return new LedgerError(`Rejected by the contract: ${text(args)}.`, status, { name: revert.name, args });
+  }
+  if (err?.code === "CALL_EXCEPTION") return new LedgerError(`Contract call reverted: ${msg}`, 422);
+  return new LedgerError(`Blockchain error: ${msg}`, 502);
+}
 
-/** Simple promise queue: transactions are sent one at a time so nonces stay ordered. */
-class Mutex {
+class Queue {
   private tail: Promise<unknown> = Promise.resolve();
   run<T>(fn: () => Promise<T>): Promise<T> {
     const next = this.tail.then(fn, fn);
@@ -102,17 +135,36 @@ class Mutex {
   }
 }
 
-export function walletFor(identity: Identity, provider?: JsonRpcProvider): Wallet {
-  const m = Mnemonic.fromPhrase(HARDHAT_TEST_MNEMONIC);
-  const hd = HDNodeWallet.fromMnemonic(m, `m/44'/60'/0'/0/${identity.index}`);
-  return new Wallet(hd.privateKey, provider);
-}
+/** Sign locally, broadcast, wait, journal. Shared by the app, deployment and the benchmark. */
+export class Sender {
+  readonly provider: JsonRpcProvider;
+  readonly journal?: Journal;
+  private queue = new Queue();
+  constructor(provider: JsonRpcProvider, journal?: Journal) {
+    this.provider = provider;
+    this.journal = journal;
+  }
 
-export function makeProvider(rpcUrl: string, chainId = 31337): JsonRpcProvider {
-  const network = Network.from(chainId);
-  const provider = new JsonRpcProvider(rpcUrl, network, { staticNetwork: network, batchMaxCount: 1, cacheTimeout: -1 });
-  provider.pollingInterval = 100;
-  return provider;
+  send(wallet: Wallet, req: TransactionRequest): Promise<{ hash: string; blockNumber: number; timestamp: number; gasUsed: number; logs: any[]; contractAddress: string | null }> {
+    return this.queue.run(async () => {
+      const signer = wallet.connect(this.provider);
+      const populated = await signer.populateTransaction(req);
+      populated.gasLimit = (BigInt(populated.gasLimit ?? 0) * 12n) / 10n;
+      const raw = await signer.signTransaction(populated);
+      const hash: string = await this.provider.send("eth_sendRawTransaction", [raw]);
+      let receipt = null;
+      for (let i = 0; i < 600 && !receipt; i++) {
+        receipt = await this.provider.getTransactionReceipt(hash);
+        if (!receipt) await new Promise((r) => setTimeout(r, 20));
+      }
+      if (!receipt) throw new LedgerError(`timed out waiting for ${hash}`, 504);
+      const block = await this.provider.getBlock(receipt.blockNumber);
+      const timestamp = block?.timestamp ?? 0;
+      this.journal?.append({ kind: "tx", raw, hash, block: receipt.blockNumber, timestamp });
+      if (receipt.status !== 1) throw new LedgerError("transaction was mined but reverted", 422);
+      return { hash, blockNumber: receipt.blockNumber, timestamp, gasUsed: Number(receipt.gasUsed), logs: [...receipt.logs], contractAddress: receipt.contractAddress };
+    });
+  }
 }
 
 export class Ledger {
@@ -121,205 +173,95 @@ export class Ledger {
   readonly address: string;
   readonly chainId: number;
   readonly rpcUrl: string;
-  private wallets = new Map<string, Wallet>();
-  private mutex = new Mutex();
+  readonly keyring: Keyring;
+  readonly sender: Sender;
 
-  constructor(rpcUrl: string, address: string, chainId = 31337) {
-    const { abi } = loadArtifact();
-    this.rpcUrl = rpcUrl;
-    this.chainId = chainId;
-    this.address = address;
-    this.provider = makeProvider(rpcUrl, chainId);
-    this.contract = new Contract(address, abi, this.provider);
-    for (const id of IDENTITIES) this.wallets.set(id.id, walletFor(id, this.provider));
+  constructor(opts: { rpcUrl: string; address: string; keyring: Keyring; journal?: Journal; chainId?: number }) {
+    this.rpcUrl = opts.rpcUrl;
+    this.address = opts.address;
+    this.chainId = opts.chainId ?? 31337;
+    this.keyring = opts.keyring;
+    this.provider = makeProvider(opts.rpcUrl, this.chainId);
+    this.contract = new Contract(opts.address, loadArtifact().abi, this.provider);
+    this.sender = new Sender(this.provider, opts.journal);
   }
 
-  addressOf(identityId: string): string {
-    const w = this.wallets.get(identityId);
-    if (!w) throw new LedgerError(`unknown demo identity "${identityId}"`, 400);
-    return w.address;
-  }
-
-  /** Throws a helpful LedgerError if the RPC is down or no contract is deployed at the address. */
-  async ping(): Promise<{ blockNumber: number }> {
+  /** Call a state-changing contract function as a demo identity. */
+  async send(identityId: string, method: string, args: unknown[]): Promise<TxResult> {
     try {
-      const code = await this.provider.getCode(this.address);
-      if (code === "0x") throw new LedgerError(`No PatchLedger contract at ${this.address} on ${this.rpcUrl}. Re-run deployment.`, 503);
-      return { blockNumber: await this.provider.getBlockNumber() };
-    } catch (e) {
-      throw toLedgerError(e, this.rpcUrl);
-    }
-  }
-
-  async registerDevice(identityId: string, deviceKey: string, digest: string): Promise<WriteResult> {
-    return this.write(identityId, (c) => c.registerDevice(deviceKey, digest));
-  }
-
-  async appendRecord(
-    identityId: string,
-    a: { deviceKey: string; recordType: number; expectedPrevHash?: string; payloadDigest: string; refSeq?: number; outcome?: number },
-  ): Promise<WriteResult> {
-    // When the caller did not pin a predecessor, read the head inside the write lock.
-    return this.write(identityId, async (c) =>
-      c.appendRecord(
-        a.deviceKey,
-        a.recordType,
-        a.expectedPrevHash ?? (await this.headHash(a.deviceKey)),
-        a.payloadDigest,
-        a.refSeq ?? NO_REF,
-        a.outcome ?? 0,
-      ),
-    );
-  }
-
-  /** Low-level escape hatch used by the tamper lab to send arbitrary (expected-to-fail) calls. */
-  async rawWrite(identityId: string, fn: (c: Contract) => Promise<unknown>): Promise<WriteResult> {
-    return this.write(identityId, fn);
-  }
-
-  private async write(identityId: string, fn: (c: Contract) => Promise<unknown>): Promise<WriteResult> {
-    const wallet = this.wallets.get(identityId);
-    if (!wallet) throw new LedgerError(`unknown demo identity "${identityId}"`, 400);
-    return this.mutex.run(async () => {
-      try {
-        const c = this.contract.connect(wallet) as Contract;
-        const tx = (await fn(c)) as { hash: string };
-        const receipt = await this.waitReceipt(tx.hash);
-        if (receipt.status !== 1) throw new LedgerError("transaction reverted on-chain", 422);
-        let ev: { seq: number; recordHash: string; prevHash: string } | undefined;
-        for (const log of receipt.logs) {
-          try {
-            const parsed = this.contract.interface.parseLog(log);
-            if (parsed?.name === "RecordAppended") {
-              ev = { seq: Number(parsed.args.seq), recordHash: parsed.args.recordHash, prevHash: parsed.args.prevHash };
-            }
-          } catch {
-            /* not ours */
-          }
+      const wallet = this.keyring.wallet(identityId);
+      const req = await this.contract.getFunction(method).populateTransaction(...args);
+      const r = await this.sender.send(wallet, { ...req, from: wallet.address });
+      const events: LogDescription[] = [];
+      for (const log of r.logs) {
+        try {
+          const ev = this.contract.interface.parseLog(log);
+          if (ev) events.push(ev);
+        } catch {
+          /* not ours */
         }
-        const block = await this.provider.getBlock(receipt.blockNumber);
-        return {
-          seq: ev?.seq ?? -1,
-          recordHash: ev?.recordHash ?? "",
-          prevHash: ev?.prevHash ?? "",
-          txHash: receipt.hash,
-          blockNumber: receipt.blockNumber,
-          gasUsed: Number(receipt.gasUsed),
-          timestamp: block?.timestamp ?? 0,
-        };
-      } catch (e) {
-        throw toLedgerError(e, this.rpcUrl, this.contract);
       }
-    });
-  }
-
-  private async waitReceipt(hash: string): Promise<TransactionReceipt> {
-    // Poll directly: the local chain automines, so the receipt is normally ready at once.
-    for (let i = 0; i < 600; i++) {
-      const r = await this.provider.getTransactionReceipt(hash);
-      if (r) return r;
-      await new Promise((res) => setTimeout(res, 25));
-    }
-    throw new LedgerError(`timed out waiting for transaction ${hash}`, 504);
-  }
-
-  async getRecords(deviceKey: string): Promise<OnChainRecord[]> {
-    try {
-      const raw = (await this.contract.getRecords(deviceKey)) as unknown[];
-      return raw.map((r: any, i) => ({
-        seq: i,
-        recordHash: r.recordHash,
-        prevHash: r.prevHash,
-        payloadDigest: r.payloadDigest,
-        actor: r.actor,
-        timestamp: Number(r.timestamp),
-        recordType: Number(r.recordType),
-        outcome: Number(r.outcome),
-        refSeq: Number(r.refSeq),
-      }));
+      return { hash: r.hash, blockNumber: r.blockNumber, timestamp: r.timestamp, gasUsed: r.gasUsed, events };
     } catch (e) {
       throw toLedgerError(e, this.rpcUrl, this.contract);
     }
   }
 
-  async headHash(deviceKey: string): Promise<string> {
-    return (await this.contract.headHash(deviceKey)) as string;
-  }
-
-  async verifyChain(deviceKey: string): Promise<{ ok: boolean; firstBadSeq: number }> {
-    const [ok, bad] = await this.contract.verifyChain(deviceKey);
-    return { ok: Boolean(ok), firstBadSeq: Number(bad) };
-  }
-
-  async roleMask(address: string): Promise<number> {
-    return Number(await this.contract.roles(address));
-  }
-
-  async stats(): Promise<{ devices: number; records: number; openDisputes: number; blockNumber: number }> {
-    const [d, r, o, b] = await Promise.all([
-      this.contract.deviceCount(),
-      this.contract.totalRecords(),
-      this.contract.totalOpenDisputes(),
-      this.provider.getBlockNumber(),
-    ]);
-    return { devices: Number(d), records: Number(r), openDisputes: Number(o), blockNumber: b };
-  }
-
-  /** Names of every state-changing function in the deployed ABI (used to show there is no edit/delete). */
-  mutatingFunctions(): string[] {
-    const out: string[] = [];
-    this.contract.interface.forEachFunction((f) => {
-      if (f.stateMutability !== "view" && f.stateMutability !== "pure") out.push(f.format("sighash"));
-    });
-    return out;
-  }
-}
-
-export function toLedgerError(e: unknown, rpcUrl: string, contract?: Contract): LedgerError {
-  if (e instanceof LedgerError) return e;
-  const err = e as any;
-  const code = err?.code ?? err?.error?.code;
-  const msg = String(err?.shortMessage ?? err?.message ?? e);
-  if (code === "ECONNREFUSED" || /ECONNREFUSED|fetch failed|socket hang up|connect ECONN/i.test(msg + String(err?.cause ?? ""))) {
-    return new LedgerError(`Local blockchain unavailable at ${rpcUrl}. Is the Hardhat node running? (start everything with ./run.sh)`, 503);
-  }
-  let revert = err?.revert as { name: string; args: unknown[] } | undefined;
-  if (!revert && contract && err?.data) {
+  async ping(): Promise<number> {
     try {
-      const parsed = contract.interface.parseError(err.data);
-      if (parsed) revert = { name: parsed.name, args: [...parsed.args] };
-    } catch {
-      /* ignore */
+      const code = await this.provider.getCode(this.address);
+      if (code === "0x") throw new LedgerError(`No VulnSeal contract at ${this.address}. Run ./run.sh to deploy or restore it.`, 503);
+      return await this.provider.getBlockNumber();
+    } catch (e) {
+      throw toLedgerError(e, this.rpcUrl, this.contract);
     }
   }
-  if (revert) {
-    const args = revert.args.map((a) => String(a));
-    const text = ERROR_TEXT[revert.name]?.(args) ?? revert.name;
-    return new LedgerError(`Contract rejected the transaction: ${text}`, ERROR_STATUS[revert.name] ?? 422, { name: revert.name, args });
+
+  async read<T = any>(method: string, ...args: unknown[]): Promise<T> {
+    try {
+      return (await this.contract.getFunction(method).staticCall(...args)) as T;
+    } catch (e) {
+      throw toLedgerError(e, this.rpcUrl, this.contract);
+    }
   }
-  if (code === "CALL_EXCEPTION") return new LedgerError(`Contract call reverted: ${msg}`, 422);
-  return new LedgerError(`Blockchain error: ${msg}`, 502);
 }
 
-/** Deploy PatchLedger with the registrar identity and grant every demo role. */
-export async function deployPatchLedger(rpcUrl: string, chainId = 31337): Promise<{ address: string; blockNumber: number; gasUsed: number }> {
-  const provider = makeProvider(rpcUrl, chainId);
-  const { abi, bytecode } = loadArtifact();
-  const admin = walletFor(IDENTITIES[0], provider);
-  const factory = new ContractFactory(abi, bytecode, admin);
-  const deployed = await factory.deploy();
-  const deployTx = deployed.deploymentTransaction()!;
-  const receipt = await provider.getTransactionReceipt(deployTx.hash) ?? (await deployTx.wait())!;
-  const address = await deployed.getAddress();
-  const c = new Contract(address, abi, admin);
-  for (const id of IDENTITIES) {
-    for (const r of id.roles) {
-      if (id.index === 0 && r === "REGISTRAR") continue; // granted in constructor
-      const w = walletFor(id);
-      const tx = await c.grantRole(w.address, ROLE[r]);
-      await tx.wait(1, 30_000);
-    }
+export function eventArg(events: LogDescription[], name: string, arg: string): any {
+  const ev = events.find((e) => e.name === name);
+  if (!ev) throw new Error(`expected ${name} event`);
+  return ev.args[arg];
+}
+
+/**
+ * Deploy VulnSeal from the governor key, fund every demo identity from the faucet and
+ * register participants. Programs are registered by the caller (they need policy digests).
+ */
+export async function deployVulnSeal(opts: {
+  rpcUrl: string;
+  keyring: Keyring;
+  journal?: Journal;
+  appealWindowSeconds?: number;
+  threshold?: number;
+}): Promise<{ address: string; gasUsed: number; blockNumber: number }> {
+  const provider = makeProvider(opts.rpcUrl);
+  const sender = new Sender(provider, opts.journal);
+  const faucet = faucetWallet();
+  for (const id of opts.keyring.ids()) {
+    await sender.send(faucet, { to: opts.keyring.address(id), value: 100n * 10n ** 18n });
   }
+  const { abi, bytecode } = loadArtifact();
+  const factory = new ContractFactory(abi, bytecode);
+  const deployTx = await factory.getDeployTransaction(opts.appealWindowSeconds ?? 7 * 24 * 3600, opts.threshold ?? 2);
+  const governor = opts.keyring.wallet("governor");
+  const r = await sender.send(governor, { ...deployTx, from: governor.address });
   provider.destroy();
-  return { address, blockNumber: receipt.blockNumber, gasUsed: Number(receipt.gasUsed) };
+  return { address: r.contractAddress!, gasUsed: r.gasUsed, blockNumber: r.blockNumber };
+}
+
+export async function registerParticipants(ledger: Ledger) {
+  for (const d of IDENTITY_DEFS) {
+    if (d.kind === "governor" || d.kind === "outsider") continue;
+    if (d.kind === "researcher") await ledger.send(d.id, "registerResearcher", []);
+    else await ledger.send("governor", "registerParticipant", [ledger.keyring.address(d.id), roleMask(d.roles), d.programId]);
+  }
 }

@@ -1,4 +1,4 @@
-// Runtime configuration. Everything binds to 127.0.0.1 by default.
+// Runtime configuration. Everything binds to 127.0.0.1 unless told otherwise.
 import fs from "node:fs";
 import path from "node:path";
 
@@ -9,8 +9,8 @@ export interface Deployment {
   chainId: number;
   rpcUrl: string;
   deployedAt: string;
-  blockNumber: number;
-  gasUsed: number;
+  appealWindowSeconds: number;
+  threshold: number;
 }
 
 export interface AppConfig {
@@ -18,33 +18,44 @@ export interface AppConfig {
   port: number;
   dataDir: string;
   dbPath: string;
+  keyDir: string;
   evidenceDir: string;
+  chainDir: string;
+  journalPath: string;
   deploymentPath: string;
+  keyringPath: string;
   webDist: string;
   resultsDir: string;
   demoLab: boolean;
-  publicBaseUrl: string;
 }
 
-export function loadConfig(env = process.env): AppConfig {
-  const dataDir = path.resolve(ROOT, env.PL_DATA_DIR ?? "data");
-  const host = env.PL_HOST ?? "127.0.0.1";
-  const port = Number(env.PL_PORT ?? 4600);
+export function loadConfig(env: Record<string, string | undefined> = process.env): AppConfig {
+  const dataDir = path.resolve(ROOT, env.VS_DATA_DIR ?? "data");
+  const chainDir = path.join(dataDir, "chain");
+  const keyDir = path.join(dataDir, "keys");
   return {
-    host,
-    port,
+    host: env.VS_HOST ?? "127.0.0.1",
+    port: Number(env.VS_PORT ?? 4700),
     dataDir,
-    dbPath: path.join(dataDir, "patchledger.sqlite"),
+    dbPath: path.join(dataDir, "vulnseal.sqlite"),
+    keyDir,
     evidenceDir: path.join(dataDir, "evidence"),
-    deploymentPath: path.join(dataDir, "deployment.json"),
-    webDist: path.resolve(ROOT, env.PL_WEB_DIST ?? "web/dist"),
-    resultsDir: path.resolve(ROOT, env.PL_RESULTS_DIR ?? "docs/results"),
-    demoLab: (env.PL_DEMO_LAB ?? "1") !== "0",
-    publicBaseUrl: env.PL_PUBLIC_URL ?? `http://${host}:${port}`,
+    chainDir,
+    journalPath: path.join(chainDir, "journal.jsonl"),
+    deploymentPath: path.join(chainDir, "deployment.json"),
+    keyringPath: path.join(keyDir, "identities.sealed"),
+    webDist: path.resolve(ROOT, env.VS_WEB_DIST ?? "web/dist"),
+    resultsDir: path.resolve(ROOT, env.VS_RESULTS_DIR ?? "docs/results"),
+    demoLab: (env.VS_DEMO_LAB ?? "1") !== "0",
   };
 }
 
 export function readDeployment(p: string): Deployment {
-  if (!fs.existsSync(p)) throw new Error(`No deployment found at ${p}. Run ./run.sh (or npm run deploy) first.`);
+  if (!fs.existsSync(p)) throw new Error(`No deployment at ${p}. Start with ./run.sh.`);
   return JSON.parse(fs.readFileSync(p, "utf8"));
+}
+
+export function writeDeployment(p: string, d: Deployment) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(d, null, 2));
 }
