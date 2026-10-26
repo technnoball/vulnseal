@@ -8,16 +8,18 @@
 
 | What | Where |
 |------|-------|
-| PatchLedger code, as presented | branch `main` (pushed to GitHub as `technnoball/patchledger`) and tag `patchledger-v1` |
+| PatchLedger code, as presented | commit `a296516` (in this repository's history), local branch `patchledger` and tag `patchledger-v1` |
 | PatchLedger runtime data (database, evidence, archives) | `data-patchledger/` (gitignored, untouched) |
-| PatchLedger documents and benchmark results | `docs/archive-patchledger/` and on `main` |
+| PatchLedger documents and benchmark results | `docs/archive-patchledger/` and at commit `a296516` |
 | The interrupted first attempt at this migration (22 Oct), exactly as found | tag `vulnseal-wip-2026-10-22` (a stash commit including untracked files) |
-| VulnSeal | branch `vulnseal` |
+| VulnSeal | branch `main` (GitHub: `technnoball/vulnseal`) |
+
+VulnSeal was developed on a `vulnseal` branch on top of PatchLedger's `main` and published as its own repository on 26 Oct 2026. Locally, PatchLedger's branch was renamed `patchledger` and VulnSeal's became `main`. If the `patchledger` branch is missing (for example in a fresh clone), recreate it with `git branch patchledger a296516`.
 
 To run PatchLedger again:
 
 ```bash
-git switch main
+git switch patchledger
 ```
 
 ```bash
@@ -27,7 +29,7 @@ git switch main
 Back to VulnSeal:
 
 ```bash
-git switch vulnseal
+git switch main
 ```
 
 The two projects use different default ports (PatchLedger 4600, VulnSeal 4700) and different data files.
@@ -37,7 +39,7 @@ The two projects use different default ports (PatchLedger 4600, VulnSeal 4700) a
 The `vulnseal` branch already existed, holding a half-finished migration:
 
 - **Staged:** PatchLedger documents moved to `docs/archive-patchledger/`, and old modules deleted.
-- **Untracked copies:** 9 files byte-identical to `main` (PatchLedger's contract, service, seed, documents).
+- **Untracked copies:** 9 files byte-identical to PatchLedger's `main` (its contract, service, seed, documents).
 - **New, unfinished work:** VulnSeal infrastructure modules from 22 Oct:
   - `commitment.ts`, `journal.ts`, `vault.ts`, `keys.ts`, `session.ts`;
   - reworked `chain.ts`, `db.ts`, `domain.ts`, `config.ts`;

@@ -3,7 +3,7 @@
 ## Environment
 
 - macOS 26.5 on arm64 (Apple M4), Node v24.19.0, npm 11.17.0.
-- Branch `vulnseal`. PatchLedger is preserved on `main`, in tag `patchledger-v1` and in `data-patchledger/`. See [MIGRATION_NOTES.md](MIGRATION_NOTES.md).
+- Branch `main` (GitHub: `technnoball/vulnseal`). PatchLedger is preserved at commit `a296516`, on the local branch `patchledger`, in tag `patchledger-v1` and in `data-patchledger/`. See [MIGRATION_NOTES.md](MIGRATION_NOTES.md).
 - **Dependencies:**
   - Runtime: express 5.3, multer 2.5, ethers 6.17, qrcode, react / react-dom 19.3, lucide-react 1.61, IBM Plex fonts.
   - Development: hardhat 2.29.1 (solc 0.8.28), typescript 5.9, vite 7.3, @vitejs/plugin-react 5.2.
